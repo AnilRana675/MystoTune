@@ -1,0 +1,49 @@
+# Bench overlay for the M3 soak (§7 / §4.12 verification). Never for production:
+# seeds synthetic fixtures into an anonymous volume and skips Telegram creds.
+#   docker compose -f compose.bench.yaml up -d
+#   node scripts/remote-soak.mjs http://127.0.0.1:18080 bench-secret-... --seconds 60
+#   docker stats --no-stream bitbench-compose ; docker compose -f compose.bench.yaml down
+services:
+  addon:
+    build: .
+    image: bitchord:slim
+    restart: "no"
+    mem_limit: 192m # §4.12 planning limit, enforced by cgroup
+    memswap_limit: 384m
+    init: true
+    read_only: false # bench-only: the seed needs a writable fixture dir
+    tmpfs:
+      - /tmp
+      - /app/test # fixture audio files land here
+    environment:
+      PORT: "8080"
+      LOG_LEVEL: warn
+      NODE_ENV: production
+      DB_PATH: /data/index.sqlite
+      ADDON_SECRET: bench-secret-0123456789abcdef0123456789abcdef
+      MEDIA_SIGNING_KEY: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5
+      PUBLIC_BASE_URL: http://127.0.0.1:18080
+      ALLOW_INSECURE_BASE_URL: "1"
+      MEDIA_URL_TTL_SECONDS: "3600"
+      NODE_OPTIONS: "--max-old-space-size=72 --max-semi-space-size=2 --heapsnapshot-signal=SIGUSR2"
+      UV_THREADPOOL_SIZE: "2"
+      MALLOC_ARENA_MAX: "2"
+    entrypoint: sh
+    command:
+      - -c
+      - node dist/scripts/seed-fixture.js && exec node dist/src/server.js
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>r.json()).then(j=>process.exit(j.ok&&j.indexCount>=6?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "2m", max-file: "1" }
+    volumes:
+      - bench-data:/data # anonymous volume: disposable index for the bench
+    ports:
+      - "127.0.0.1:18080:8080"
+
+volumes:
+  bench-data:

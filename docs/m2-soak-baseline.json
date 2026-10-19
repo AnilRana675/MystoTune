@@ -1,0 +1,20 @@
+{
+  "label": "M2 soak baseline (capped NODE_OPTIONS, fixtures only — telegram byte path separate)",
+  "date": "2026-10-19",
+  "env": "NODE_OPTIONS='--max-old-space-size=72 --max-semi-space-size=2', UV_THREADPOOL_SIZE=2, MALLOC_ARENA_MAX=2",
+  "durationSec": 26,
+  "workers": 2,
+  "requests": 28616,
+  "ok": 28616,
+  "fiveXX": 0,
+  "bytesServedMB": 7975.1,
+  "p50Ms": 1,
+  "p95Ms": 5,
+  "maxMs": 27,
+  "firstByteP95Ms": 5,
+  "maxActiveStreams": 2,
+  "maxQueued": 0,
+  "maxRssKiB": 147620,
+  "maxHeapUsedKiB": 24667,
+  "exitOk": true
+}

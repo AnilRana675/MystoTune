@@ -1,0 +1,71 @@
+{
+  "generatedAt": "2026-10-19T14:09:23.340Z",
+  "seconds": 25,
+  "workers": 3,
+  "runs": [
+    {
+      "image": "bitchord:slim",
+      "variant": "slim",
+      "buildMs": 3386,
+      "stats": {
+        "maxRssKiB": 54589,
+        "limitKiB": 196608,
+        "soak": {
+          "base": "http://127.0.0.1:18091",
+          "seconds": 25,
+          "workers": 3,
+          "startedAt": "2026-10-19T14:08:28.369Z",
+          "requests": 62743,
+          "ok": 62743,
+          "clientErr429": 0,
+          "fiveXX": 0,
+          "bytesServed": 1146268845,
+          "maxRssKiB": 92460,
+          "maxHeapUsedKiB": 19745,
+          "maxActive": 1,
+          "maxQueued": 0,
+          "errors": [],
+          "p50Ms": 2,
+          "p95Ms": 5,
+          "maxMs": 23,
+          "firstByteP95Ms": 3,
+          "bytesServedMB": 1093.2,
+          "finishedAt": "2026-10-19T14:08:54.437Z"
+        },
+        "soakExit": 0
+      }
+    },
+    {
+      "image": "bitchord:alpine",
+      "variant": "alpine",
+      "buildMs": 3499,
+      "stats": {
+        "maxRssKiB": 50340,
+        "limitKiB": 196608,
+        "soak": {
+          "base": "http://127.0.0.1:18091",
+          "seconds": 25,
+          "workers": 3,
+          "startedAt": "2026-10-19T14:08:56.774Z",
+          "requests": 46327,
+          "ok": 46327,
+          "clientErr429": 0,
+          "fiveXX": 0,
+          "bytesServed": 844678562,
+          "maxRssKiB": 95808,
+          "maxHeapUsedKiB": 20020,
+          "maxActive": 1,
+          "maxQueued": 0,
+          "errors": [],
+          "p50Ms": 3,
+          "p95Ms": 7,
+          "maxMs": 26,
+          "firstByteP95Ms": 3,
+          "bytesServedMB": 805.5,
+          "finishedAt": "2026-10-19T14:09:22.846Z"
+        },
+        "soakExit": 0
+      }
+    }
+  ]
+}
