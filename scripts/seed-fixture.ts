@@ -203,6 +203,7 @@ export function seedFixtureDb(
       docId: fnv1a(id),
       source: "fixture",
       filePath,
+      hasThumb: 0,
     });
     if (!opts.quiet) {
       console.log(

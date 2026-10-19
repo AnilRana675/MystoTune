@@ -27,6 +27,7 @@ const seedTelegramRow = (): void => {
     docId: 90,
     source: "telegram",
     filePath: null,
+    hasThumb: 0,
   });
 };
 

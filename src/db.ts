@@ -25,15 +25,21 @@ export interface TrackRow {
   bitrateKbps: number | null;
   /** Telegram document id (used for ETag / LRU keys), positive int64. */
   docId: number;
+  /** source: "telegram" | "fixture"; */
   source: "telegram" | "fixture";
   /** Fixture-only: absolute path to a local file standing in for Telegram. */
   filePath: string | null;
+  /** FR-12: the indexed document carried a thumbnail (art is served live). */
+  hasThumb: number;
   addedAt: number;
 }
 
-export type UpsertTrack = Omit<TrackRow, "rowid" | "addedAt">;
+export type UpsertTrack = Omit<TrackRow, "rowid" | "addedAt"> & {
+  /** enrichment (M4 probes) preserves the original index time when set */
+  addedAt?: number;
+};
 
-const SCHEMA_VERSION = "1";
+const SCHEMA_VERSION = "2";
 const FETCH_LIMIT = 200; // candidate pool before JS-side boost/dedupe (§4.17)
 
 export function openDb(dbPath: string): Database.Database {
@@ -69,6 +75,7 @@ export function createSchema(db: Database.Database): void {
       docId       INTEGER NOT NULL,
       source      TEXT NOT NULL DEFAULT 'telegram',
       filePath    TEXT,
+      hasThumb    INTEGER NOT NULL DEFAULT 0,
       addedAt     INTEGER NOT NULL
     );
     CREATE UNIQUE INDEX IF NOT EXISTS tracks_chat_msg ON tracks(chatId, msgId);
@@ -79,8 +86,13 @@ export function createSchema(db: Database.Database): void {
       tokenize = 'unicode61 remove_diacritics 2'
     );
   `);
+  // v1 → v2 migration: FR-12 hasThumb column on pre-M4 databases
+  const cols = db.prepare("PRAGMA table_info(tracks)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "hasThumb")) {
+    db.exec("ALTER TABLE tracks ADD COLUMN hasThumb INTEGER NOT NULL DEFAULT 0");
+  }
   const meta = db.prepare<{ v: string }>(
-    "INSERT INTO meta(key, value) VALUES('schema_version', @v) ON CONFLICT(key) DO NOTHING",
+    "INSERT INTO meta(key, value) VALUES('schema_version', @v) ON CONFLICT(key) DO UPDATE SET value = @v",
   );
   meta.run({ v: SCHEMA_VERSION });
 }
@@ -89,10 +101,22 @@ export function createSchema(db: Database.Database): void {
 
 export function upsertTrack(db: Database.Database, t: UpsertTrack): void {
   const run = db.transaction((track: UpsertTrack) => {
-    // FTS is synced manually against the tracks rowid (§4.6.3); replace = delete+insert
-    stmts(db).deleteRowForTrack.run({ id: track.id, chatId: track.chatId, msgId: track.msgId });
-    const info = stmts(db).insertTrack.run({ ...track, addedAt: Date.now() });
-    stmts(db).insertFts.run({
+    const s = stmts(db);
+    // FTS is synced manually against the tracks rowid (§4.6.3); replace = delete+insert.
+    // The replaced rows' FTS entries must be purged first, or the recycled rowid
+    // collides with the stale docid on re-insert (SQLITE_CONSTRAINT_PRIMARYKEY).
+    const oldRowids = new Set<number>();
+    const byId = s.byId.get({ id: track.id }) as { rowid: number | bigint } | undefined;
+    if (byId) oldRowids.add(Number(byId.rowid));
+    const byChatMsg = s.rowidsByChatMsg.all({
+      chatId: track.chatId,
+      msgId: track.msgId,
+    }) as Array<{ rowid: number | bigint }>;
+    for (const r of byChatMsg) oldRowids.add(Number(r.rowid));
+    for (const rowid of oldRowids) s.deleteFtsRow.run({ rowid });
+    s.deleteRowForTrack.run({ id: track.id, chatId: track.chatId, msgId: track.msgId });
+    const info = s.insertTrack.run({ ...track, addedAt: track.addedAt ?? Date.now() });
+    s.insertFts.run({
       rowid: Number(info.lastInsertRowid),
       title: track.title,
       artist: track.artist,
@@ -203,10 +227,10 @@ export function restoreTrackSnapshot(db: Database.Database, snap: IndexSnapshot)
   const insert = db.prepare(`
       INSERT INTO tracks (id, chatId, msgId, title, artist, album, duration, mime, size,
                           fileName, codec, container, lossless, bitrateKbps, docId,
-                          source, filePath, addedAt)
+                          source, filePath, hasThumb, addedAt)
       VALUES (@id, @chatId, @msgId, @title, @artist, @album, @duration, @mime, @size,
               @fileName, @codec, @container, @lossless, @bitrateKbps, @docId,
-              @source, @filePath, @addedAt)
+              @source, @filePath, @hasThumb, @addedAt)
     `);
   const run = db.transaction(() => {
     for (const row of snap.tracks) {
@@ -237,6 +261,7 @@ export function restoreTrackSnapshot(db: Database.Database, snap: IndexSnapshot)
         docId: Number.isFinite(docId) ? docId : 0,
         source: row.source,
         filePath: row.filePath ?? null,
+        hasThumb: Number(row.hasThumb) === 1 ? 1 : 0,
         id: row.id,
       });
       stmts(db).insertFts.run({
@@ -300,6 +325,7 @@ interface CandidateRow {
   docId: number;
   source: string;
   filePath: string | null;
+  hasThumb: number;
   addedAt: number;
   r: number; // bm25 rank, lower is better
 }
@@ -399,6 +425,7 @@ function trackOf(r: CandidateRow): TrackRow {
     lossless: r.lossless,
     bitrateKbps: r.bitrateKbps,
     docId: r.docId,
+    hasThumb: r.hasThumb,
     source: r.source === "fixture" ? "fixture" : "telegram",
     filePath: r.filePath,
     addedAt: r.addedAt,
@@ -410,6 +437,7 @@ function trackOf(r: CandidateRow): TrackRow {
 interface Statements {
   insertTrack: Database.Statement<Record<string, unknown>>;
   deleteRowForTrack: Database.Statement<{ id: string; chatId: number; msgId: number }>;
+  rowidsByChatMsg: Database.Statement<Record<string, unknown>>;
   deleteByRowid: Database.Statement<Record<string, unknown>>;
   insertFts: Database.Statement<Record<string, unknown>>;
   deleteFtsRow: Database.Statement<Record<string, unknown>>;
@@ -430,13 +458,16 @@ function stmts(db: Database.Database): Statements {
     s = {
       insertTrack: db.prepare(`
         INSERT INTO tracks (id, chatId, msgId, title, artist, album, duration, mime, size,
-                            fileName, codec, container, lossless, bitrateKbps, docId, source, filePath, addedAt)
+                            fileName, codec, container, lossless, bitrateKbps, docId, source,
+                            filePath, hasThumb, addedAt)
         VALUES (@id, @chatId, @msgId, @title, @artist, @album, @duration, @mime, @size,
-                @fileName, @codec, @container, @lossless, @bitrateKbps, @docId, @source, @filePath, @addedAt)
+                @fileName, @codec, @container, @lossless, @bitrateKbps, @docId, @source,
+                @filePath, @hasThumb, @addedAt)
       `),
       deleteRowForTrack: db.prepare(`
         DELETE FROM tracks WHERE id = @id OR (chatId = @chatId AND msgId = @msgId)
       `),
+      rowidsByChatMsg: db.prepare("SELECT rowid FROM tracks WHERE chatId = @chatId AND msgId = @msgId"),
       deleteByRowid: db.prepare("DELETE FROM tracks WHERE rowid = @rowid"),
       insertFts: db.prepare(
         "INSERT INTO tracks_fts(rowid, title, artist, album, fileName) VALUES (@rowid, @title, @artist, @album, @fileName)",

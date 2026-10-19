@@ -29,6 +29,7 @@ test.before(async () => {
     docId: 42,
     source: "fixture",
     filePath: ts.tracks[0]!.filePath,
+    hasThumb: 0,
   });
 });
 test.after(async () => {

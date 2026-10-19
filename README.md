@@ -35,7 +35,7 @@ forces an immediate index pass against the live session. Never run `npm run
 session` on an untrusted machine: the StringSession is your Telegram account
 credential.
 
-## The four endpoints (M0 contract)
+## The endpoints (M0 contract, M4 artwork)
 
 | Route                             | Notes                                                     |
 | --------------------------------- | --------------------------------------------------------- |
@@ -43,6 +43,7 @@ credential.
 | `GET /{secret}/search?q=&quality=&atmos=` | FTS5 + bm25, hostile-q safe, order kept, cap 25    |
 | `GET /{secret}/stream/{id}`       | signed media URL; 404 empty on miss; 503/429 upstream     |
 | `GET|HEAD /media/{token}`         | no secret prefix (signature is the credential)            |
+| `GET|HEAD /art/{token}`           | M4 artwork: kind-tagged token, ETag/304, thumbless ⇒ 404  |
 
 `/media` honours `Range` (200/206/416), `If-Range`, optimistic `HEAD`,
 `ETag {docId}-{size}`, `Cache-Control: private, max-age=300`; ≤4 KiB probes and HEAD
@@ -61,7 +62,7 @@ headers are committed, so cold/FloodWait/expired-reference failures surface as r
 ## Tests & soak
 
 ```bash
-npm test                        # 77 assertions across contract/range/query/admission/fault/m1/m2/m3
+npm test                        # 94 assertions across contract/range/query/admission/fault/m1/m2/m3/m4
 npm run soak -- --seconds 60 --out docs/m2-soak-baseline.json
 ```
 
@@ -116,5 +117,18 @@ stays the default image for its glibc `MALLOC_ARENA_MAX` support).
   fake RESP2 Redis (`test/fake-redis.ts`) — limiter buckets, q-cache cap/eviction,
   msg-meta TTL + no-fileReference, flood adoption, snapshot export/restore, and
   the §7 "Redis stopped ⇒ search and playback keep working" fallback contract.
-- **M4** — extras: artwork `/art/{token}`, ID3 probing (album + real bitrate),
-  ALAC detection.
+- **M4 ✅ extras (FR-12/FR-13/§4.5)** — artwork `/art/{token}`: kind-tagged art
+  signing prevents token replay between `/media` and `/art`; search rows carry an
+  absolute `artworkURL` when the document has a thumbnail (cap 25 kept);
+  thumbnails are re-read from the live document at request time (no thumb bytes
+  in SQLite), with inline `PhotoStripped` thumbs served zero-RPC and photo-size
+  renditions streamed through the 512 KiB bridge keyed by `thumbSize`; ETag +
+  `If-None-Match` 304 + HEAD support with private 1-day caching. Deep probing
+  (FR-13, P1): the first 64 KB of a document is read at first `/stream` (one
+  probe-scan per row per process, flood-safe) — FLAC STREAMINFO fills
+  duration+sampleRate (§4.5: `.m4a` still reports the conservative `aac` codec
+  until ALAC is proven), MP3 ID3 fills missing album/artist strictly behind
+  attribute/caption priority (§4.6.2), and m4a `stsd=alac` upgrades the row to
+  `Lossless · ALAC` truthfully. SQLite FTS hygiene: `upsertTrack` purges the
+  replaced rows' FTS docids so enrichment re-upserts cannot collide. Tests:
+  94/94 across contract/range/query/admission/fault/m1/m2/m3/m4.

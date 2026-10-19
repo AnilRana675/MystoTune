@@ -70,8 +70,10 @@ export interface MetaInput {
   attrPerformer?: string | null;
   fileName?: string | null;
   caption?: string | null;
-  /** optional ID3 probe result (FR-13, M4 fills it) */
+  /** optional ID3 probe result (FR-13) — priority (c), fills what (a)/(b) missed */
   album?: string | null;
+  id3Title?: string | null;
+  id3Artist?: string | null;
 }
 
 /**
@@ -99,6 +101,9 @@ export function parseTrackMeta(input: MetaInput): ParsedMeta | null {
     }
   }
   if (!title && fallbackBase) title = fallbackBase;
+  // (c) FR-13 ID3 fills — strictly after (a)/(b)
+  if (!title && input.id3Title) title = cleanName(input.id3Title) ?? title;
+  if (!artist && input.id3Artist) artist = cleanName(input.id3Artist) ?? artist;
   if (!title) return null;
   return { title, artist, album: input.album ?? null };
 }
@@ -145,6 +150,12 @@ export function audioDescriptor(
   fileName: string | null | undefined,
   size: number | null,
   duration: number | null,
+  /**
+   * Probed codec correction (FR-13/M4). Only ever UPGRADES a conservative
+   * label: a probed ALAC payload in an .m4a flips codec to alac/lossless —
+   * ADTS (container "aac") cannot carry ALAC and is left untouched.
+   */
+  knownCodec?: string | null,
 ): AudioDescriptor {
   let d = mime ? KNOWN_TYPES[mime.toLowerCase()] : undefined;
   if (!d && fileName) {
@@ -154,6 +165,9 @@ export function audioDescriptor(
   const lossyKbps = size && duration ? Math.round((size * 8) / duration / 1000) : null;
   if (!d) {
     return { codec: null, container: null, lossless: false, bitrateKbps: lossyKbps };
+  }
+  if (knownCodec === "alac" && d.container === "mp4") {
+    return { codec: "alac", container: "mp4", lossless: true, bitrateKbps: null };
   }
   return { ...d, bitrateKbps: d.lossless ? null : lossyKbps };
 }
@@ -212,6 +226,8 @@ export interface RawDocMessage {
   voice: boolean;
   /** message text (media caption in Telegram terms) */
   caption: string | null;
+  /** FR-12: the document carries at least one thumbnail */
+  hasThumb: boolean;
 }
 
 /**
@@ -271,5 +287,6 @@ export function transformDocumentMessage(raw: RawDocMessage): UpsertTrack | null
     docId: docIdFromLong(raw.docId),
     source: "telegram",
     filePath: null,
+    hasThumb: raw.hasThumb ? 1 : 0,
   };
 }

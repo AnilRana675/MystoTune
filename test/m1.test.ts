@@ -36,6 +36,7 @@ const RAW = (over: Partial<RawDocMessage> = {}): RawDocMessage => ({
   duration: 42,
   voice: false,
   caption: null,
+  hasThumb: false,
   ...over,
 });
 
@@ -348,6 +349,7 @@ test("ready-state telegram row: /stream 200 signed url, HEAD /media real headers
       docId: 7654321,
       source: "telegram",
       filePath: null,
+      hasThumb: 0,
     };
     upsertTrack(ts.db, row);
     ts.telegram.resolvedDocs.set(row.id, {
@@ -436,5 +438,6 @@ function telegramRowFor(msgId: number, title: string): UpsertTrack {
     docId: 88000 + msgId,
     source: "telegram",
     filePath: null,
+    hasThumb: 0,
   };
 }

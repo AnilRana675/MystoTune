@@ -15,6 +15,7 @@ import type { AppConfig } from "./config";
 import { docIdFromLong, type RawDocMessage } from "./indexer";
 import type { ByteSource } from "./media";
 import { WINDOW, alignDown, sliceForWindow } from "./download-window";
+import { etagFor } from "./sign";
 import type { RedisStore, ResolvedDocMeta } from "./redis";
 
 import { FileMigrateError } from "telegram/errors";
@@ -47,6 +48,25 @@ interface DocShape {
   accessHash: string;
   fileReference: Buffer;
   dcId: number | null;
+  /** FR-12 thumbnails (duck-typed: PhotoSize vs PhotoStrippedSize) */
+  thumbs: Array<{ kind: "photo" | "stripped"; type: string; size: number; bytes: Buffer | null }>;
+}
+
+/** Pick the artwork source for /art (FR-12): largest regular photo size, else
+ * the inline stripped bytes (served with zero RPC), else null. */
+function chooseThumb(thumbs: DocShape["thumbs"]): ResolvedDocThumb | null {
+  let bestPhoto: { type: string; size: number } | null = null;
+  let stripped: { type: string; bytes: Buffer } | null = null;
+  for (const t of thumbs) {
+    if (t.kind === "photo") {
+      if (!bestPhoto || t.size > bestPhoto.size) bestPhoto = { type: t.type, size: t.size };
+    } else if (t.bytes && t.bytes.length > 0 && !stripped) {
+      stripped = { type: t.type, bytes: Buffer.from(t.bytes) };
+    }
+  }
+  if (bestPhoto && bestPhoto.size > 0) return { type: bestPhoto.type, size: bestPhoto.size, stripped: null };
+  if (stripped) return { type: stripped.type, size: stripped.bytes.length, stripped: stripped.bytes };
+  return null;
 }
 
 /** Pull the underlying Document out of a friendly Api.Message. */
@@ -54,6 +74,16 @@ function docOf(m: ApiNs.Message | undefined): DocShape | null {
   if (!m) return null;
   const doc = m.document;
   if (!doc || !doc.id || !doc.size) return null;
+  const thumbs: DocShape["thumbs"] = [];
+  for (const t of (doc.thumbs ?? []) as unknown as Array<Record<string, unknown>>) {
+    const type = typeof t["type"] === "string" ? (t["type"] as string) : "";
+    const bytes = t["bytes"];
+    if (bytes instanceof Uint8Array) {
+      thumbs.push({ kind: "stripped", type, size: bytes.length, bytes: Buffer.from(bytes) });
+    } else if (typeof t["size"] === "number") {
+      thumbs.push({ kind: "photo", type, size: t["size"] as number, bytes: null });
+    }
+  }
   return {
     id: doc.id.toString(),
     size: doc.size.toJSNumber(),
@@ -62,6 +92,7 @@ function docOf(m: ApiNs.Message | undefined): DocShape | null {
     accessHash: doc.accessHash?.toString() ?? "",
     fileReference: doc.fileReference ?? Buffer.alloc(0),
     dcId: typeof doc.dcId === "number" && doc.dcId > 0 ? doc.dcId : null,
+    thumbs,
   };
 }
 
@@ -113,6 +144,17 @@ export class Lru<V> {
   }
 }
 
+/** A document thumbnail (FR-12): either an inline stripped JPEG or a regular
+ * photo size that streams from the DC on demand. */
+export interface ResolvedDocThumb {
+  /** Telegram thumb size letter ("s"|"m"|"x"|"y"|"i"|"j") */
+  type: string;
+  /** bytes for photo sizes; stripped inline bytes length for stripped */
+  size: number;
+  /** inline JPEG for PhotoStrippedSize — servable with zero RPC */
+  stripped: Buffer | null;
+}
+
 export interface ResolvedDocument {
   docId: number;
   size: number;
@@ -125,6 +167,19 @@ export interface ResolvedDocument {
   accessHash: string;
   fileReference: Buffer | null;
   dcId: number | null;
+  /** FR-12: largest thumb (photo) or inline stripped bytes; null when none */
+  thumb?: ResolvedDocThumb | null;
+}
+
+/** FR-12 artwork payload for GET /art: inline bytes (PhotoStrippedSize, served
+ * with zero RPC) or a byte stream sourced from the document's thumbnail
+ * rendition over the 512 KiB bridge. size is the authoritative length. */
+export interface ArtSource {
+  size: number;
+  /** per-render ETag used for If-None-Match 304s */
+  etag: string;
+  bytes?: Buffer;
+  stream?: (start: number, end: number, signal: AbortSignal) => AsyncIterable<Buffer>;
 }
 
 /** Convert to the persisted Redis form (which must exclude fileReference). */
@@ -519,6 +574,7 @@ export class TelegramManager {
       duration,
       voice,
       caption: m.message ?? null,
+      hasThumb: shape.thumbs.length > 0, // FR-12
     };
   }
 
@@ -588,6 +644,7 @@ export class TelegramManager {
           accessHash: meta.accessHash,
           fileReference: null, // never persisted — refetched on stream (§4.14)
           dcId: meta.dcId,
+          thumb: null, // thumb info lives only in live docs (FR-12)
         };
         this.resolvedDocs.set(entry.id, doc);
         return doc;
@@ -635,6 +692,7 @@ export class TelegramManager {
       accessHash: shape.accessHash,
       fileReference: shape.fileReference,
       dcId: shape.dcId,
+      thumb: chooseThumb(shape.thumbs), // FR-12
     };
     // §4.11 write-through: cache the metadata (WITHOUT the file reference) for
     // sibling instances / restart warm-up; failures are invisible by design.
@@ -678,6 +736,83 @@ export class TelegramManager {
    */
   windowOpener: WindowOpener | null = null;
 
+  /* ------------------------------------------------ M4 deep probe (FR-13) */
+
+  /**
+   * First ≤max bytes of a document (FR-13 probes read the ID3 / STREAMINFO /
+   * stsd headers, which all live in the opening bytes). Exactly ONE window
+   * request through the same windowOpener seam as telegramDocIter, so tests
+   * stay network-free. Returns null only when Telegram hands back no bytes.
+   */
+  async firstBytes(entry: EntryLike, max: number, signal: AbortSignal): Promise<Buffer | null> {
+    let doc = this.resolvedDocs.get(entry.id) ?? null;
+    if (!doc || !doc.fileReference) doc = await this.fetchResolvedDoc(entry);
+    const bytes = this.windowOpener
+      ? await this.windowOpener({ doc, offset: 0, limit: WINDOW, signal })
+      : await this.realOpenWindow(doc, 0, WINDOW, signal);
+    if (!bytes || bytes.length === 0) return null;
+    return bytes.length > max ? Buffer.from(bytes.subarray(0, max)) : bytes;
+  }
+
+  /* ------------------------------------------------ M4 artwork (FR-12) */
+
+  /**
+   * Resolve the artwork payload for /art (TRD FR-12). Returns null when the
+   * live document carries no thumbnail; HTTP errors surface as mapped
+   * TelegramSourceError kinds (429/503/404).
+   */
+  async artSource(entry: EntryLike): Promise<ArtSource | null> {
+    let doc = await this.resolveDocument(entry);
+    if (!doc) return null;
+    if (!doc.thumb && !doc.fileReference) {
+      // Redis msg:{id} metadata hits carry no thumb info (§4.14): fetch the
+      // live document once before declaring a genuine 404.
+      doc = await this.fetchResolvedDoc(entry);
+      this.resolvedDocs.set(entry.id, doc);
+    }
+    const thumb = doc.thumb;
+    if (!thumb) return null;
+    const etag = etagFor(doc.docId, thumb.size);
+    if (thumb.stripped) return { size: thumb.size, etag, bytes: thumb.stripped };
+    return { size: thumb.size, etag, stream: this.artThumbStream(doc, thumb) };
+  }
+
+  /** Thumb renditions are ≤512 KiB by Telegram design: [start..end] resolves
+   * from a single window fetched with the rendition's thumbSize selected. */
+  private artThumbStream(
+    doc: ResolvedDocument,
+    thumb: ResolvedDocThumb,
+  ): (start: number, end: number, signal: AbortSignal) => AsyncIterable<Buffer> {
+    return (start, end, signal) => {
+      const iter = this.artThumbIter(doc, thumb, start, end, signal);
+      return {
+        [Symbol.asyncIterator]() {
+          return iter;
+        },
+        destroy() {
+          void iter.return?.(undefined as never);
+        },
+      };
+    };
+  }
+
+  private async *artThumbIter(
+    doc: ResolvedDocument,
+    thumb: ResolvedDocThumb,
+    start: number,
+    end: number,
+    signal: AbortSignal,
+  ): AsyncGenerator<Buffer, void, undefined> {
+    if (end < start || start >= thumb.size) return;
+    const bytes = this.windowOpener
+      ? await this.windowOpener({ doc, offset: 0, limit: WINDOW, signal, thumbSize: thumb.type })
+      : await this.realOpenWindow(doc, 0, WINDOW, signal, thumb.type);
+    const avail = bytes ? Math.min(bytes.length, thumb.size) : 0;
+    const from = Math.min(start, avail);
+    const to = Math.min(end, avail - 1);
+    if (to >= from) yield bytes.subarray(from, to + 1);
+  }
+
   async *telegramDocIter(
     entry: EntryLike,
     start: number,
@@ -720,8 +855,15 @@ export class TelegramManager {
     }
   }
 
-  /** Real window fetch: borrowed DC sender + Api.upload.GetFile (§4.7.3/4.7.6). */
-  private async realOpenWindow(doc: ResolvedDocument, offset: number, limit: number, signal: AbortSignal): Promise<Buffer> {
+  /** Real window fetch: borrowed DC sender + Api.upload.GetFile (§4.7.3/4.7.6).
+   * thumbSize (FR-12) selects a thumbnail rendition instead of the document. */
+  private async realOpenWindow(
+    doc: ResolvedDocument,
+    offset: number,
+    limit: number,
+    signal: AbortSignal,
+    thumbSize?: string,
+  ): Promise<Buffer> {
     // Abort between requests: a settled call is at most one 512 KiB window.
     if (signal.aborted) throw abortErrorOf(signal);
     const client = this.requireConnect();
@@ -737,7 +879,7 @@ export class TelegramManager {
       id: bigInt(doc.docLongId),
       accessHash: bigInt(doc.accessHash),
       fileReference: doc.fileReference,
-      thumbSize: "",
+      thumbSize: thumbSize ?? "",
     });
     let sender = await client.getSender(doc.dcId ?? 0); // §4.7.6: warm DC pool
     for (let attempt = 0; ; attempt++) {
@@ -797,6 +939,8 @@ export interface WindowRequest {
   /** = WINDOW except at EOF where Telegram may return less */
   limit: number;
   signal: AbortSignal;
+  /** FR-12: set when the window targets a thumbnail rendition (M4 /art) */
+  thumbSize?: string;
 }
 
 export type WindowOpener = (req: WindowRequest) => Promise<Buffer>;

@@ -17,6 +17,8 @@ import type { Metrics } from "../src/server.js";
 import { openRedisStore, type RedisStore } from "../src/redis.js";
 import { seedFixtureDb, CHAT_ID } from "../scripts/seed-fixture.js";
 
+export { CHAT_ID };
+
 export const TEST_SECRET = "0123456789abcdef0123456789abcdef0123abcd";
 
 export interface AugmentedApp extends FastifyInstance {

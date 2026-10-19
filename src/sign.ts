@@ -53,11 +53,64 @@ export function verifyMediaToken(token: string | undefined, key: Buffer, nowMs: 
     return null;
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-  const { id, exp } = parsed as { id?: unknown; exp?: unknown };
+  const { id, exp, k } = parsed as { id?: unknown; exp?: unknown; k?: unknown };
+  // FR-12 (M4): kind-tagged tokens are single-purpose — an art token is never
+  // a media token (they are both HMAC tokens over the same key).
+  if (k !== undefined) return null;
   if (typeof id !== "string" || !ID_PATTERN.test(id)) return null;
   if (typeof exp !== "number" || !Number.isSafeInteger(exp)) return null;
   const nowSec = Math.floor(nowMs / 1000);
   if (exp <= nowSec) return null; // expired
+  return { id, exp };
+}
+
+/* ------------------------------------------------------------------ FR-12 art */
+
+export interface ArtToken {
+  id: string;
+  exp: number;
+}
+
+/** Art tokens carry k:"art" so the same key cannot cross endpoints. */
+export function createArtToken(id: string, key: Buffer, ttlSeconds: number, nowMs: number = Date.now()): string {
+  const exp = Math.floor(nowMs / 1000) + Math.floor(ttlSeconds);
+  const payload = b64url(Buffer.from(JSON.stringify({ id, exp, k: "art" }), "utf8"));
+  const sig = b64url(createHmac("sha256", key).update(payload).digest());
+  return `${payload}.${sig}`;
+}
+
+/** Returns the parsed token or null. Caller maps null -> 403. */
+export function verifyArtToken(token: string | undefined, key: Buffer, nowMs: number = Date.now()): ArtToken | null {
+  if (!token) return null;
+  const dot = token.indexOf(".");
+  if (dot <= 0 || dot !== token.lastIndexOf(".")) return null;
+  const [payload, sig] = [token.slice(0, dot), token.slice(dot + 1)];
+  if (!payload || !sig) return null;
+  let payloadBytes: Buffer;
+  try {
+    payloadBytes = Buffer.from(payload, "base64url");
+  } catch {
+    return null;
+  }
+  if (payloadBytes.length === 0 || payloadBytes.length > 512) return null;
+  const expected = createHmac("sha256", key).update(payload).digest();
+  const given = Buffer.from(sig, "base64url");
+  const a = expected.length === given.length ? expected : Buffer.alloc(Math.max(expected.length, given.length));
+  const b = expected.length === given.length ? given : a;
+  if (!timingSafeEqual(a, b)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payloadBytes.toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const { id, exp, k } = parsed as { id?: unknown; exp?: unknown; k?: unknown };
+  if (k !== "art") return null; // art tokens only
+  if (typeof id !== "string" || !ID_PATTERN.test(id)) return null;
+  if (typeof exp !== "number" || !Number.isSafeInteger(exp)) return null;
+  const nowSec = Math.floor(nowMs / 1000);
+  if (exp <= nowSec) return null;
   return { id, exp };
 }
 

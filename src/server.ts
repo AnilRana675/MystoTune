@@ -12,7 +12,16 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 
 import { RATE_LIMITS, loadConfig, type AppConfig } from "./config";
-import { countTracks, createSchema, getTrack, openDb, searchTracks, type TrackRow } from "./db";
+import {
+  countTracks,
+  createSchema,
+  getTrack,
+  openDb,
+  searchTracks,
+  upsertTrack,
+  type TrackRow,
+  type UpsertTrack,
+} from "./db";
 import {
   AdmissionCancelledError,
   AdmissionTimeoutError,
@@ -21,9 +30,10 @@ import {
   parseRange,
   type ByteSource,
 } from "./media";
-import { createMediaToken, etagFor, verifyMediaToken } from "./sign";
-import { TelegramManager, TelegramSourceError } from "./telegram";
-import { audioDescriptor, audioQuality, formatOf, parseTrackId, qualityLabel } from "./indexer";
+import { createArtToken, createMediaToken, etagFor, verifyArtToken, verifyMediaToken } from "./sign";
+import { Lru, TelegramManager, TelegramSourceError, type ArtSource } from "./telegram";
+import { audioDescriptor, audioQuality, cleanName, formatOf, parseTrackId, qualityLabel } from "./indexer";
+import { probeFirstBytes } from "./probe";
 import { IndexIndexer, restoreSnapshotIfEmpty } from "./index-loop";
 import { openRedisStore, type RedisStore } from "./redis";
 
@@ -268,7 +278,7 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     } else {
       rows = searchTracks(db, q);
     }
-    return jsonify(reply, { tracks: rows.map(toProtocolTrack) });
+    return jsonify(reply, { tracks: rows.map((r) => toProtocolTrack(r, artCtx(cfg))) });
   });
 
   /* --------------------------------------------------------------- stream */
@@ -298,10 +308,13 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
       }
     } else {
       await telegram.resolveDocument(row);
+      // FR-13 (M4): fire-and-forget deep probe — fills album/duration, detects
+      // ALAC; never blocks or fails the stream response (§4.13).
+      void enrichRow(db, telegram, row);
     }
 
     const token = createMediaToken(row.id, cfg.mediaSigningKey, cfg.mediaUrlTtlSeconds);
-    const d = audioDescriptor(row.mime, row.fileName, row.size, row.duration);
+    const d = audioDescriptor(row.mime, row.fileName, row.size, row.duration, row.codec);
     return jsonify(reply, {
       url: `${cfg.publicBaseUrl}/media/${token}`,
       format: formatOf(d, row.fileName, row.mime) ?? undefined,
@@ -505,6 +518,112 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
   app.get("/media/:token", (req, reply) => withMedia(req, reply, "GET"));
   app.head("/media/:token", (req, reply) => withMedia(req, reply, "HEAD"));
 
+  /* ------------------------------------------------------------- /art/:token */
+
+  /** FR-12 (M4): serve a Telegram audio thumbnail. Art tokens are kind-tagged
+   * ("art") so they cannot be replayed against /media and vice versa; artwork is
+   * immutable per document, so responses carry ETag + long private caching. */
+  const withArt = async (req: FastifyRequest, reply: FastifyReply, method: "GET" | "HEAD") => {
+    const token = (req.params as { token?: string }).token ?? "";
+    const hit = verifyArtToken(token, cfg.mediaSigningKey);
+    if (!hit) return reply.code(403).send({}); // never disclose which check failed
+    const row = getTrack(db, hit.id);
+    if (!row || row.source !== "telegram" || row.hasThumb !== 1) {
+      return reply.code(404).send({}); // unknown id or thumbless document
+    }
+
+    let src: ArtSource | null = null;
+    try {
+      src = await telegram.artSource(row);
+    } catch (err) {
+      if (err instanceof TelegramSourceError) {
+        if (err.kind === "flood") {
+          metrics.floodWaits += 1;
+          return reply.code(429).header("retry-after", String(err.retryAfterSeconds ?? 30)).send({});
+        }
+        if (err.kind === "fatal" || err.kind === "not_found") return reply.code(404).send({});
+        metrics.telegram503 += 1;
+        return reply.code(503).header("retry-after", String(err.retryAfterSeconds ?? 30)).send({});
+      }
+      metrics.telegram503 += 1;
+      return reply.code(502).send({});
+    }
+    if (!src || src.size <= 0) return reply.code(404).send({});
+
+    const cacheHeaders = {
+      "content-type": "image/jpeg",
+      "cache-control": "private, max-age=86400",
+      etag: src.etag,
+    };
+    const withCacheHeaders = (r: FastifyReply): FastifyReply => {
+      r.header("content-type", cacheHeaders["content-type"])
+        .header("cache-control", cacheHeaders["cache-control"])
+        .header("etag", cacheHeaders.etag);
+      return r;
+    };
+    /** HEAD and 304 replies carry no payload; fastify refuses to serialize a
+     * body onto a 304, so both go through the raw response directly. */
+    const rawNoBody = (code: number, contentLength: string | null): FastifyReply => {
+      reply.hijack();
+      reply.raw.statusCode = code;
+      reply.raw.setHeader("content-type", cacheHeaders["content-type"]);
+      reply.raw.setHeader("cache-control", cacheHeaders["cache-control"]);
+      reply.raw.setHeader("etag", cacheHeaders.etag);
+      if (contentLength !== null) reply.raw.setHeader("content-length", contentLength);
+      reply.raw.end();
+      return reply;
+    };
+    if (method === "HEAD") {
+      return rawNoBody(200, String(src.size));
+    }
+    if (ifNoneMatchHit(req.headers, src.etag)) {
+      return rawNoBody(304, null);
+    }
+
+    try {
+      if (src.bytes) {
+        return withCacheHeaders(reply.code(200)).header("content-length", String(src.bytes.length)).send(src.bytes);
+      }
+      const ac = new AbortController();
+      const socket = req.raw.socket ?? null;
+      const onConnClose = () => ac.abort();
+      const swallow = () => undefined; // client aborts mid-fetch must not crash
+      if (socket) {
+        socket.once("close", onConnClose);
+        socket.once("error", swallow);
+      }
+      const parts: Buffer[] = [];
+      let total = 0;
+      try {
+        for await (const chunk of src.stream!(0, src.size - 1, ac.signal)) {
+          parts.push(Buffer.from(chunk));
+          total += chunk.length;
+          if (total >= src.size) break;
+        }
+      } finally {
+        if (socket) {
+          socket.off("close", onConnClose);
+          socket.off("error", swallow);
+        }
+      }
+      if (total === 0) return reply.code(404).send({}); // rendition vanished
+      return withCacheHeaders(reply.code(200)).header("content-length", String(total)).send(Buffer.concat(parts));
+    } catch (err) {
+      if (err instanceof TelegramSourceError) {
+        if (err.kind === "flood") {
+          metrics.floodWaits += 1;
+          return reply.code(429).header("retry-after", String(err.retryAfterSeconds ?? 30)).send({});
+        }
+        if (err.kind === "fatal" || err.kind === "not_found") return reply.code(404).send({});
+        return reply.code(503).header("retry-after", String(err.retryAfterSeconds ?? 30)).send({});
+      }
+      return reply.code(502).send({});
+    }
+  };
+
+  app.get("/art/:token", (req, reply) => withArt(req, reply, "GET"));
+  app.head("/art/:token", (req, reply) => withArt(req, reply, "HEAD"));
+
   /* -------------------------------------------------------------- healthz */
 
   app.get("/healthz", (_req, reply) => {
@@ -564,9 +683,17 @@ function allowsIfRange(headers: unknown, etag: string): boolean {
   return strip(ir) === strip(etag);
 }
 
+/** Artwork context (FR-12): absolute artworkURL on rows that carry a thumb. */
+export interface ArtUrlContext {
+  publicBaseUrl: string;
+  signingKey: Buffer;
+  urlTtlSeconds: number;
+  nowMs: number;
+}
+
 /* protocol row (§4.3): required non-empty id+title; other fields only when known */
-export function toProtocolTrack(r: TrackRow): Record<string, unknown> {
-  const d = audioDescriptor(r.mime, r.fileName, r.size, r.duration);
+export function toProtocolTrack(r: TrackRow, art?: ArtUrlContext): Record<string, unknown> {
+  const d = audioDescriptor(r.mime, r.fileName, r.size, r.duration, r.codec);
   const out: Record<string, unknown> = { id: r.id, title: r.title };
   if (r.artist) out["artist"] = r.artist;
   if (r.album) out["album"] = r.album;
@@ -574,7 +701,96 @@ export function toProtocolTrack(r: TrackRow): Record<string, unknown> {
   const format = formatOf(d, r.fileName, r.mime);
   if (format) out["format"] = format;
   out["audioQuality"] = audioQuality(d);
+  if (art && r.hasThumb === 1) {
+    out["artworkURL"] = `${art.publicBaseUrl}/art/${createArtToken(r.id, art.signingKey, art.urlTtlSeconds, art.nowMs)}`;
+  }
   return out;
+}
+
+/** Per-request artwork token context; urls expire with media url TTL (§4.8). */
+function artCtx(cfg: AppConfig): ArtUrlContext {
+  return {
+    publicBaseUrl: cfg.publicBaseUrl,
+    signingKey: cfg.mediaSigningKey,
+    urlTtlSeconds: cfg.mediaUrlTtlSeconds,
+    nowMs: Date.now(),
+  };
+}
+
+/** If-None-Match hit check for /art 304s. */
+function ifNoneMatchHit(headers: unknown, etag: string): boolean {
+  const raw = (headers as Record<string, unknown> | null)?.["if-none-match"];
+  if (typeof raw !== "string") return false;
+  const strip = (v: string) => v.replace(/^W\//, "").replace(/"/g, "").trim();
+  return raw.split(",").some((c) => strip(c) === strip(etag) || c.trim() === "*");
+}
+
+/* --------------------------------------------------- FR-13 deep probe (M4) */
+
+/** One probe-scan per row per process (§4.13 flood-safety). */
+const probedRows = new Lru<true>(1000, 24 * 3600_000);
+
+/** Rows whose first 64 KB can still change something on the row (M4). */
+export function probeNeeded(row: TrackRow): boolean {
+  if (row.source !== "telegram" || row.mime === null) return false;
+  if (row.mime === "audio/mpeg") return !row.album || !row.artist; // ID3 (c)
+  if (row.mime === "audio/mp4" || row.mime === "audio/x-m4a") return row.codec !== "alac";
+  if (row.mime === "audio/flac" || row.mime === "audio/x-flac") return row.duration === null;
+  return false;
+}
+
+/**
+ * Lazy FR-13 enrichment: a track's first stream reads its first 64 KB once and
+ * upgrades the row in place — ID3 fills (album/artist only: §4.6.2 keeps
+ * attributes/filename above ID3), FLAC duration from STREAMINFO, and m4a ALAC
+ * detection (§4.5 truthfulness). Best-effort: exceptions are swallowed and the
+ * indexed labels stay.
+ */
+export async function enrichRow(db: ReturnType<typeof openDb>, telegram: TelegramManager, row: TrackRow): Promise<void> {
+  if (probedRows.get(row.id) || !probeNeeded(row)) return;
+  probedRows.set(row.id, true); // before any await: failures never repeat scans
+  const ac = new AbortController();
+  try {
+    const head = await telegram.firstBytes(row, 65536, ac.signal);
+    const probe = head ? probeFirstBytes(head, row.mime) : null;
+    if (!probe) return;
+    const patch: UpsertTrack = {
+      id: row.id,
+      chatId: row.chatId,
+      msgId: row.msgId,
+      title: row.title,
+      artist: row.artist,
+      album: row.album,
+      duration: row.duration,
+      mime: row.mime,
+      size: row.size,
+      fileName: row.fileName,
+      codec: row.codec,
+      container: row.container,
+      lossless: row.lossless,
+      bitrateKbps: row.bitrateKbps,
+      docId: row.docId,
+      source: row.source,
+      filePath: row.filePath,
+      hasThumb: row.hasThumb,
+      addedAt: row.addedAt, // enrichment must not bump the sync timestamp
+    };
+    if (probe.id3) {
+      if (!patch.album && probe.id3.album) patch.album = (cleanName(probe.id3.album) ?? probe.id3.album.trim()) || null;
+      if (!patch.artist && probe.id3.artist) patch.artist = (cleanName(probe.id3.artist) ?? probe.id3.artist.trim()) || null;
+    }
+    if (probe.flac && patch.duration === null && probe.flac.durationSec) patch.duration = probe.flac.durationSec;
+    if (probe.mp4?.alac) {
+      patch.codec = "alac";
+      patch.lossless = 1;
+      patch.bitrateKbps = null;
+    }
+    upsertTrack(db, patch);
+  } catch {
+    void 0; // enrichment never fails nor blocks the stream (§4.13)
+  } finally {
+    ac.abort();
+  }
 }
 
 /* ----------------------------------------------------------------- entry */

@@ -317,6 +317,7 @@ function rowFull(): UpsertTrack {
     docId: 7654321,
     source: "telegram",
     filePath: null,
+    hasThumb: 0,
   };
 }
 
