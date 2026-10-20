@@ -36,7 +36,7 @@ import {
   parseStoredConfig,
   type StoredConfigV1,
 } from "../src/configStore.js";
-import { applyStoredConfig, ConfigError, loadConfig } from "../src/config.js";
+import { applyStoredConfig, ConfigError, loadConfig, packageVersion } from "../src/config.js";
 
 const SEED_A = Buffer.alloc(32, 0x11);
 const SEED_B = Buffer.alloc(32, 0x22);
@@ -277,6 +277,12 @@ test("config: RENDER_EXTERNAL_URL fills the public base URL", () => {
     PUBLIC_BASE_URL: "https://custom.example.com",
   } as NodeJS.ProcessEnv);
   assert.equal(explicit.publicBaseUrl, "https://custom.example.com");
+});
+
+test("config: packageVersion walks to the real manifest (dist boots, no 0.0.0)", () => {
+  const v = packageVersion();
+  assert.match(v, /^\d+\.\d+\.\d+/);
+  assert.notEqual(v, "0.0.0", "version capture must not fall back under either layout");
 });
 
 /* ===================== M6.1 session lease (doc 7.11/Appendix A) ===================== */

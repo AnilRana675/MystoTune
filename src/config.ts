@@ -166,14 +166,24 @@ function parseDeployProfile(env: NodeJS.ProcessEnv): DeployProfile {
   return env["RENDER"] ? "render" : "vps";
 }
 
-function packageVersion(): string {
-  try {
-    const pkgPath = path.join(__dirname, "..", "package.json");
-    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
-    return pkg.version ?? "0.0.0";
-  } catch {
-    return "0.0.0";
+/**
+ * FR-24 (addon manifest version). Render boots dist/src/server.js, where
+ * ".." from __dirname is dist/ — package.json lives TWO levels up — so walk
+ * the candidate roots instead of assuming the tsx layout. ADDON_VERSION env
+ * still overrides (loadConfig).
+ */
+export function packageVersion(): string {
+  for (const up of ["..", "../.."]) {
+    try {
+      const pkg = JSON.parse(readFileSync(path.join(__dirname, up, "package.json"), "utf8")) as {
+        version?: string;
+      };
+      return pkg.version ?? "0.0.0";
+    } catch {
+      /* try the next root */
+    }
   }
+  return "0.0.0";
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
