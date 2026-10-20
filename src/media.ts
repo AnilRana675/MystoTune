@@ -4,6 +4,7 @@
  * serveMedia lives in server.ts and only needs an entry with a byte source.
  */
 import { createReadStream as fsCreateReadStream, type ReadStream } from "node:fs";
+import type { RedisStore } from "./redis.js";
 
 export interface ParsedRange {
   kind: "none" | "full" | "slice" | "unsatisfiable";
@@ -60,22 +61,28 @@ interface Grant {
 }
 
 /**
- * §4.14 / FR-19: count only requests actively streaming bytes. HEAD and
- * <=4 KiB range probes are free. Extra requests queue for ADMISSION_WAIT_MS,
- * then 503/Retry-After 2. A new Range request with the same token aborts the
- * previous one so a seek storm never stacks up.
+ * §4.14 / FR-19 (TRD v2.2 FINAL): count only requests actively streaming
+ * bytes. HEAD and <=4 KiB range probes are free. Up to MAX PER TOKEN
+ * concurrent streams coexist (players probe the tail while playing); the 3rd
+ * concurrent request for the same token aborts the OLDEST one synchronously.
+ * Additional tokens queue for ADMISSION_WAIT_MS, then 503/Retry-After 2.
  */
 export class Admissions {
-  private active = new Map<string, Grant>();
+  /** token -> its live grants (≤ maxPerToken; eviction aborts the oldest). */
+  private active = new Map<string, Grant[]>();
   private waiters: Array<{ resolve: () => void; timer: NodeJS.Timeout | null }> = [];
 
   constructor(
     private readonly maxActive: number,
     private readonly waitMs: number,
+    private readonly maxPerToken = 2,
   ) {}
 
+  /** Live grants across all tokens (health surfaces this as activeStreams). */
   get activeCount(): number {
-    return this.active.size;
+    let n = 0;
+    for (const list of this.active.values()) n += list.length;
+    return n;
   }
 
   get waitingCount(): number {
@@ -83,12 +90,19 @@ export class Admissions {
   }
 
   async acquire(token: string, opts: { probe: boolean; signal?: AbortSignal }): Promise<Grant> {
-    if (!opts.probe) await this.replaceActiveToken(token);
+    // FR-19: the 3rd concurrent request for a token evicts the OLDEST active
+    // stream of that token synchronously — the new request never queues.
+    if (!opts.probe) this.evictOldestForToken(token);
     for (;;) {
       if (this.signalAborted(opts.signal)) throw new AdmissionCancelledError();
-      if (opts.probe || this.active.size < this.maxActive) {
+      const perToken = this.active.get(token)?.length ?? 0;
+      if (opts.probe || (perToken < this.maxPerToken && this.activeCount < this.maxActive)) {
         const grant = this.makeGrant(token, opts.probe);
-        if (!opts.probe) this.active.set(token, grant);
+        if (!opts.probe) {
+          const list = this.active.get(token) ?? [];
+          list.push(grant);
+          this.active.set(token, list);
+        }
         return grant;
       }
       await this.enqueue(opts.signal);
@@ -99,8 +113,15 @@ export class Admissions {
     if (grant.released) return;
     grant.released = true;
     if (!grant.probe) {
-      this.active.delete(grant.token);
-      this.wake();
+      const list = this.active.get(grant.token);
+      if (list) {
+        const idx = list.indexOf(grant);
+        if (idx >= 0) {
+          list.splice(idx, 1);
+          if (list.length === 0) this.active.delete(grant.token);
+          this.wake(); // a global slot truly opened up
+        }
+      }
     }
     grant.notify();
   }
@@ -120,31 +141,15 @@ export class Admissions {
     };
   }
 
-  /** FR-19: new request with the same token aborts the previous active one. */
-  private async replaceActiveToken(token: string): Promise<void> {
-    const prior = this.active.get(token);
-    if (!prior) return;
-    prior.controller.abort();
-    await this.waitForRelease(prior);
-  }
-
-  private waitForRelease(grant: Grant): Promise<void> {
-    if (grant.released) return Promise.resolve();
-    let poll: NodeJS.Timeout | undefined;
-    return new Promise<void>((resolve) => {
-      const check = () => {
-        if (grant.released) {
-          if (poll) clearInterval(poll);
-          resolve();
-        }
-      };
-      poll = setInterval(check, 5);
-      check();
-      setTimeout(() => {
-        if (poll) clearInterval(poll);
-        resolve();
-      }, 5000);
-    });
+  /** Abort the oldest grant of this token; the new request takes its slot. */
+  private evictOldestForToken(token: string): void {
+    const list = this.active.get(token);
+    if (!list || list.length < this.maxPerToken) return;
+    const oldest = list.shift()!;
+    oldest.released = true; // the evicted stream's release() becomes a no-op
+    oldest.controller.abort();
+    oldest.notify();
+    if (list.length === 0) this.active.delete(token);
   }
 
   private enqueue(signal?: AbortSignal): Promise<void> {
@@ -180,6 +185,39 @@ export class Admissions {
 }
 
 export class AdmissionCancelledError extends Error {}
+
+/** §4.15 Render profile: monthly egress budget (MONTHLY_BYTES_BUDGET). The
+ * Redis key bytes:month survives restarts and self-resets at the UTC month
+ * roll; a local counter covers Redis-less deployments and offline windows.
+ * When exceeded, /media and /stream answer 404 so BitChord falls back to a
+ * lower tier instead of an error, and Render never suspends for egress. */
+export class MonthlyBudget {
+  private localBytes = 0;
+
+  constructor(
+    private readonly budget: number,
+    private readonly redis: RedisStore | null,
+  ) {}
+
+  /** True once this month's streamed bytes reached the budget (0 = disabled). */
+  async exceeded(): Promise<boolean> {
+    if (this.budget <= 0) return false;
+    const value = Math.max(this.localBytes, this.redis ? await this.redis.readBytesMonth() : 0);
+    return value >= this.budget;
+  }
+
+  /** Count streamed bytes (never throws; the Redis write is fire-and-forget). */
+  add(n: number): void {
+    if (!Number.isFinite(n) || n <= 0) return;
+    this.localBytes += n;
+    this.redis?.addBytesMonth(n);
+  }
+
+  /** Process-local accounting snapshot (surfaced via /healthz, §4.15). */
+  get usedLocal(): number {
+    return this.localBytes;
+  }
+}
 
 /* ------------------------------------------------------------- byte source */
 

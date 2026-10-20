@@ -2,6 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createMediaToken } from "../src/sign.js";
+import { Admissions, AdmissionTimeoutError } from "../src/media.js";
 import { buildTestServer, type TestServer } from "./util.js";
 
 let ts: TestServer;
@@ -41,26 +42,40 @@ const done = async (r: { reader: ReadableStreamDefaultReader<Uint8Array> }): Pro
   await r.reader.cancel().catch(() => {});
 };
 
-test("same token re-request aborts the previous active stream", async () => {
+test("up to two streams per token coexist; the 3rd evicts the oldest (FR-19 v2.2)", async () => {
   const url = urlFor(6);
   const first = await hold(url);
-  const size = ts.tracks[0]!.size!;
   await new Promise((r) => setTimeout(r, 80));
 
-  // SAME token must replace, not stack (seek-ahead rule)
+  // A player may probe the tail while playing: TWO concurrent grants per token
   const second = await hold(url);
   assert.ok(first.first.byteLength > 0);
-  assert.ok(first.first.byteLength < size, "first stream cut short");
-  // the aborted first reader should be closed by the server
-  const follow = await first.reader.read().then(
-    (r) => (r.done ? "done" : "chunk"),
-    (e: unknown) => "error",
-  );
-  await new Promise((r) => setTimeout(r, 40));
-  const h = await health();
-  assert.ok(h.activeStreams <= 1, `active=${h.activeStreams}`);
+  const h2 = await health();
+  assert.equal(h2.activeStreams, 2, "two concurrent streams on one token");
+
+  // The THIRD same-token request evicts the oldest grant synchronously
+  const third = await hold(url);
+  const h3 = await health();
+  assert.equal(h3.activeStreams, 2, "evicted one + the new one");
+
+  // the evicted first reader must eventually be closed by the server
+  const follow = await (async (): Promise<string> => {
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 20));
+      const r = await first.reader
+        .read()
+        .then((x) => (x.done ? "done" : "chunk"), () => "error");
+      if (r !== "chunk") return r;
+    }
+  })();
+  assert.ok(follow === "done" || follow === "error", `evicted reader state: ${follow}`);
+
   await done(first);
   await done(second);
+  await done(third);
+  await new Promise((r) => setTimeout(r, 40));
+  const h = await health();
+  assert.equal(h.activeStreams, 0, "all slots released after cancels");
 });
 
 test("third concurrent full GET queues then 503 Retry-After 2", async () => {
@@ -100,4 +115,47 @@ test("range probes (<=4KiB) bypass admission while slots are full", async () => 
 
   await done(a);
   await done(b);
+});
+
+/* ----------------------- FR-19 v2.2 delta: direct Admissions unit checks */
+
+test("Admissions unit: two grants per token coexist; 3rd evicts the oldest", async () => {
+  const adm = new Admissions(4, 200);
+  const g1 = await adm.acquire("tok", { probe: false });
+  const g2 = await adm.acquire("tok", { probe: false });
+  assert.equal(adm.activeCount, 2, "two synchronous grants on one token");
+
+  const aborted = new Promise<void>((res) => g1.controller.signal.addEventListener("abort", () => res()));
+  const g3 = await adm.acquire("tok", { probe: false }); // must NOT queue
+  assert.equal(g3.probe, false);
+  assert.ok(g1.controller.signal.aborted, "oldest grant of the token was aborted");
+  await aborted;
+  assert.equal(adm.activeCount, 2, "evicted + replacement");
+
+  adm.release(g1); // evicted grants release as no-ops (already marked released)
+  adm.release(g2);
+  adm.release(g3);
+  assert.equal(adm.activeCount, 0, "all grants released");
+});
+
+test("Admissions unit: extra tokens still queue up to waitMs then 503", async () => {
+  const adm = new Admissions(2, 120);
+  const a = await adm.acquire("a", { probe: false });
+  const b = await adm.acquire("b", { probe: false });
+
+  const started = Date.now();
+  await assert.rejects(
+    adm.acquire("c", { probe: false }),
+    (e: unknown) => e instanceof AdmissionTimeoutError && e.retryAfterSeconds === 2,
+    "timeout shape",
+  );
+  assert.ok(Date.now() - started >= 100, "queued for the wait window first");
+
+  const probe = await adm.acquire("c", { probe: true }); // probes bypass
+  assert.ok(probe.controller.signal.aborted === false);
+
+  adm.release(a);
+  adm.release(b);
+  adm.release(probe);
+  assert.equal(adm.activeCount, 0);
 });

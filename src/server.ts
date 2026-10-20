@@ -26,6 +26,7 @@ import {
   AdmissionCancelledError,
   AdmissionTimeoutError,
   Admissions,
+  MonthlyBudget,
   localFileSource,
   parseRange,
   type ByteSource,
@@ -141,6 +142,8 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
   // limiter; otherwise the in-process windows. Tests may inject their own.
   const limiter = opts.rateLimiter ?? (redisStore as RateLimiter | null) ?? createRateLimiter();
   const admissions = new Admissions(cfg.maxConcurrentStreams, cfg.admissionWaitMs);
+  // §4.15 Render profile: monthly streamed-bytes budget (404 on exceed).
+  const budget = new MonthlyBudget(cfg.monthlyBytesBudget, redisStore);
 
   const app = Fastify({
     logger: { level: opts.logLevel ?? cfg.logLevel },
@@ -299,6 +302,13 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     }
     metrics.streamResolves += 1;
 
+    // §4.15: monthly egress budget exceeded ⇒ plain 404 so BitChord falls
+    // back to a lower tier instead of an error (Render never suspends us).
+    if (await budget.exceeded()) {
+      metrics.stream404 += 1;
+      return reply.code(404).send({});
+    }
+
     // Fixtures are local; telegram rows resolve through the connector first —
     // unreachable/404/429 surface here via TelegramSourceError (§4.4).
     if (row.source === "fixture") {
@@ -307,6 +317,11 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
         return reply.code(404).send({});
       }
     } else {
+      // §4.15 cold start: Fastify serves first; give the Telegram session up
+      // to 10 s to come online before surfacing a 503/Retry-After.
+      if (telegram.state === "connecting" && !(await telegram.waitForReady(10_000))) {
+        return reply.code(503).header("retry-after", "5").send({});
+      }
       await telegram.resolveDocument(row);
       // FR-13 (M4): fire-and-forget deep probe — fills album/duration, detects
       // ALAC; never blocks or fails the stream response (§4.13).
@@ -335,6 +350,8 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
 
     const row = getTrack(db, hit.id);
     if (!row || row.size === null) return reply.code(404).send({});
+    // §4.15: budget exceeded ⇒ 404 (BitChord treats it as a miss and falls back).
+    if (await budget.exceeded()) return reply.code(404).send({});
     let size = row.size;
     let etag = etagFor(row.docId, size);
     const contentType = row.mime ?? "application/octet-stream";
@@ -348,6 +365,11 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
       if (!row.filePath) return reply.code(404).send({});
       if (!isHead) source = localFileSource(row.filePath);
     } else {
+      // §4.15 cold start: media tokens may outlive a fresh deploy; only wait
+      // while a connect attempt is genuinely still in flight.
+      if (telegram.state === "connecting" && !(await telegram.waitForReady(10_000))) {
+        return reply.code(503).header("retry-after", "5").send({});
+      }
       const live = await telegram.resolveDocument(row); // 404/503/429 per §4.4 (pre-hijack)
       if (live && (live.size !== size || live.docId !== row.docId)) {
         size = live.size;
@@ -455,6 +477,7 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
             if (ac.signal.aborted) break;
           }
           metrics.bytesOut += chunk.length; // only actively streamed bytes count
+          budget.add(chunk.length); // §4.15 monthly egress budget
           chunk = null;
         }
       } finally {
@@ -638,6 +661,8 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
       arrayBuffers: kb(mem.arrayBuffers),
       activeStreams: admissions.activeCount,
       queuedStreams: admissions.waitingCount,
+      budgetBytes: budget.usedLocal, // §4.15 (process-local; bytes:month is the shared truth)
+      monthlyBytesBudget: cfg.monthlyBytesBudget,
       indexCount: countTracks(db),
       indexing: Boolean(indexer?.active),
       lastSyncAt: indexer?.lastSyncAt ?? 0,
@@ -795,6 +820,32 @@ export async function enrichRow(db: ReturnType<typeof openDb>, telegram: Telegra
 
 /* ----------------------------------------------------------------- entry */
 
+/* ------------------------------------------------------------------ boot */
+
+/** Small promise sleep used by the §4.15 boot-retry loop. */
+const delayMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * §4.15/FR-20 deploy overlap: while a Render twin still holds the session,
+ * AUTH_KEY_DUPLICATED at boot is retried (BOOT_AUTH_RETRIES × wait) before
+ * declaring the session fatal. Returns when the client is up (or fatal).
+ */
+export async function bootTelegram(
+  telegram: Pick<TelegramManager, "start" | "stop" | "state" | "detail">,
+  cfg: { bootAuthRetries: number; bootAuthRetryWaitSeconds: number },
+  log: { warn: (msg: string) => void },
+): Promise<"ready" | "fatal" | "neutral"> {
+  for (let attempts = Math.max(1, cfg.bootAuthRetries); attempts > 0; attempts -= 1) {
+    await telegram.start();
+    if (telegram.state !== "fatal") break;
+    const overlap = telegram.detail?.includes("AUTH_KEY_DUPLICATED") ?? false;
+    if (!overlap || attempts === 1) break;
+    log.warn(`session overlap (${telegram.detail}); retrying boot connect in ${cfg.bootAuthRetryWaitSeconds}s`);
+    await delayMs(cfg.bootAuthRetryWaitSeconds * 1000);
+  }
+  return telegram.state === "fatal" ? "fatal" : telegram.state === "ready" ? "ready" : "neutral";
+}
+
 export async function main(): Promise<void> {
   const cfg = loadConfig();
   const db = openDb(cfg.dbPath);
@@ -806,21 +857,24 @@ export async function main(): Promise<void> {
   await app.listen({ port: cfg.port, host: "0.0.0.0" });
   app.log.info(`BitChord addon serving on :${cfg.port} (v${cfg.addonVersion})`);
 
-  // §4.13: connect first; a fatal session must never keep the process alive
-  await telegram.start();
-  if (telegram.state === "fatal") {
-    app.log.error(`${telegram.detail} — run npm run session to re-provision; exiting`);
-    await app.close();
-    redis?.close();
-    process.exit(1);
-  }
-  // §4.11 ephemeral-disk hosts (REDIS_SNAPSHOT=1): replay the Redis snapshot
-  // when the disk index is empty so the boot sync only fetches newer messages.
+  // §4.15: Fastify is already serving. Restore a Redis snapshot into an empty
+  // disk index BEFORE the Telegram client connects, so the boot sync reads
+  // cursors (§4.11 rule 5) and only fetches newer messages.
   try {
     const restored = await restoreSnapshotIfEmpty(db, cfg, redis);
     if (restored > 0) app.log.info(`redis index snapshot restored ${restored} tracks`);
   } catch (e) {
     void e; // a down Redis must never block boot (§4.11 rule 3)
+  }
+
+  // §4.15/FR-20 deploy overlap: retry AUTH_KEY_DUPLICATED at boot (above).
+  const bootState = await bootTelegram(telegram, cfg, app.log);
+  // §4.13: a fatal session must never keep the process alive
+  if (bootState === "fatal" || telegram.state === "fatal") {
+    app.log.error(`${telegram.detail} — run npm run session to re-provision; exiting`);
+    await app.close();
+    redis?.close();
+    process.exit(1);
   }
   indexer.start();
 

@@ -62,6 +62,8 @@ export async function buildTestServer(
     rateLimiter?: RateLimiter;
     /** attach the store to the TelegramManager as main() does (M3 flood/doc) */
     telegramRedis?: boolean;
+    /** passthrough env overrides (M5: MONTHLY_BYTES_BUDGET, BOOT_AUTH_*...) */
+    extraEnv?: Record<string, string | undefined>;
   } = {},
 ): Promise<TestServer> {
   const port = await freePort();
@@ -79,6 +81,7 @@ export async function buildTestServer(
     ADMISSION_WAIT_MS: String(overrides.admissionWaitMs ?? 2000),
     LOG_LEVEL: overrides.logLevel ?? "error",
     TARGET_CHANNEL_IDS: String(CHAT_ID),
+    ...overrides.extraEnv,
   };
   const cfg = loadConfig(env);
   const db = openDb(cfg.dbPath);

@@ -14,6 +14,10 @@ const arg = (name: string): string | null => {
 const SECONDS = Math.max(5, Number(arg("--seconds") ?? 300));
 const WORKERS = Math.max(1, Number(arg("--workers") ?? 2));
 const OUT = arg("--out");
+// §4.15: the soak storms far faster than real egress can (4.5 GB in ~15 s), so
+// by default it disables the monthly budget gate to keep seek-storm semantics
+// comparable to the M2/M3 baselines. --budget keeps it enforced instead.
+const BUDGET_DISABLED = arg("--no-budget") !== null;
 
 interface Sample {
   rss: number;
@@ -36,7 +40,11 @@ function pct(xs: number[], p: number): number {
 }
 
 async function main(): Promise<void> {
-  const ts = await buildTestServer({ maxConcurrentStreams: 2, admissionWaitMs: 2000 });
+  const ts = await buildTestServer({
+    maxConcurrentStreams: 2,
+    admissionWaitMs: 2000,
+    extraEnv: BUDGET_DISABLED ? { MONTHLY_BYTES_BUDGET: "0" } : undefined,
+  });
   const KEY = Buffer.from((ts.cfg as { mediaSigningKey: Buffer }).mediaSigningKey);
   // resolve three URLs up-front (§4.10: they are valid for MEDIA_URL_TTL_SECONDS)
   const urls: Array<{ url: string; size: number }> = [6, 7].map((i) => {

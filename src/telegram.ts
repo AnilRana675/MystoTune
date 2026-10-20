@@ -216,6 +216,9 @@ export class TelegramManager {
   remoteFloodUntilSec = 0;
   /** resolved docs LRU: track id -> {docId,size,mime,..} (§4.14). */
   readonly resolvedDocs = new Lru<ResolvedDocument>(200, 10 * 60_000);
+  /** FR-21 (TRD v2.2 FINAL): full first 512 KiB window per track, so the
+   * next-track start serves byte 0 from memory (no extra Telegram call). */
+  private readonly headWindows = new Lru<Buffer>(8, 5 * 60_000);
   floodWaits = 0;
 
   private api: typeof ApiNs | null = null;
@@ -294,6 +297,29 @@ export class TelegramManager {
     if (this.connecting) return this.connecting;
     this.connecting = this.connectImpl();
     return this.connecting;
+  }
+
+  /**
+   * §4.15 (TRD v2.2 FINAL): cold starts — Fastify already serves while GramJS
+   * is still connecting, so /stream and /media wait briefly for readiness.
+   * Returns immediately true when ready; false for fatal/not_configured and
+   * for unreachable (callers keep their existing 503 mapping), and polls
+   * (100 ms) while `connecting` until ready/fatal/timeout.
+   */
+  async waitForReady(timeoutMs: number): Promise<boolean> {
+    if (this.state === "ready") return true;
+    // Only a boot connect in flight is worth waiting for: unreachable/fatal
+    // keep the existing immediate 503 mapping, and the watchdog-led reconnect
+    // path stays non-blocking (§4.13).
+    if (this.state !== "connecting" || !this.connecting) return false;
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    while (Date.now() < deadline) {
+      const s = String(this.state); // re-read across await (TS narrows unions)
+      if (s === "ready") return true;
+      if (s !== "connecting") return false;
+      await delay(100);
+    }
+    return String(this.state) === "ready";
   }
 
   async stop(): Promise<void> {
@@ -823,6 +849,17 @@ export class TelegramManager {
     let doc: ResolvedDocument | null = this.resolvedDocs.get(entry.id) ?? null;
     let refetched = false; // §4.14: re-fetch the message once and retry once
     while (pos <= end && !signal.aborted) {
+      // FR-21: byte-0 requests are served from the head-window cache when the
+      // full opening window is already resident — no Telegram call at all.
+      if (start === 0 && pos === 0) {
+        const cached = this.headWindows.get(entry.id);
+        if (cached && cached.length >= WINDOW) {
+          const out = sliceForWindow(cached, 0, start, end);
+          if (out.length) yield out;
+          pos += cached.length;
+          continue;
+        }
+      }
       // A Redis-sourced metadata entry carries no file reference: replace it
       // with the fully-resolved live doc before opening windows (§4.14).
       if (!doc || !doc.fileReference) doc = await this.fetchResolvedDoc(entry);
@@ -844,6 +881,11 @@ export class TelegramManager {
         throw e; // already a TelegramSourceError (flood/unreachable/not_found/fatal)
       }
       if (!bytes || bytes.length === 0) break; // EOS
+      if (start === 0 && pos === 0 && bytes.length >= WINDOW) {
+        // Keep the opening window warm for the next-track first byte (FR-21);
+        // only FULL windows are cached so truncation fixtures stay exact.
+        this.headWindows.set(entry.id, bytes);
+      }
       const out = sliceForWindow(bytes, pos, start, end);
       if (out.length) yield out;
       if (bytes.length < WINDOW && pos + bytes.length <= end) {

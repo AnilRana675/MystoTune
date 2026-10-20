@@ -42,6 +42,12 @@ export interface AppConfig {
   admissionWaitMs: number;
   allowDownloads: boolean;
   checkValidLossless: boolean;
+  /** §4.15 Render profile: monthly egress budget in bytes (0 disables). */
+  monthlyBytesBudget: number;
+  /** §4.15 deploy overlap: boot-time retries for AUTH_KEY_DUPLICATED. */
+  bootAuthRetries: number;
+  /** Wait between boot auth retries (seconds). */
+  bootAuthRetryWaitSeconds: number;
   logLevel: LogLevel;
   redis: { url: string; timeoutMs: number; snapshot: boolean };
 }
@@ -164,6 +170,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     admissionWaitMs: intEnv(env, "ADMISSION_WAIT_MS", 2000, 100, 60_000),
     allowDownloads: boolEnv(env, "ALLOW_DOWNLOADS", true),
     checkValidLossless: boolEnv(env, "CHECK_VALID_LOSSLESS", false),
+    monthlyBytesBudget: intEnv(env, "MONTHLY_BYTES_BUDGET", 4_500_000_000, 0, 1_000_000_000_000),
+    bootAuthRetries: intEnv(env, "BOOT_AUTH_RETRIES", 3, 1, 10),
+    bootAuthRetryWaitSeconds: intEnv(env, "BOOT_AUTH_RETRY_WAIT_SECONDS", 60, 0, 3_600),
     logLevel: LEVELS.includes(env["LOG_LEVEL"] as LogLevel) ? (env["LOG_LEVEL"] as LogLevel) : "warn",
     redis: {
       url: env["REDIS_URL"]?.trim() || "",

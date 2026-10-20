@@ -126,3 +126,82 @@ test("inverted range (start > end) is unsatisfiable 416", async () => {
   const res = await fetch(url, { headers: { range: "bytes=5-1" } });
   assert.equal(res.status, 416);
 });
+
+/* ------------------------------- M5 delta: explicit suffix / open-ended */
+
+test("suffix -N is byte-exact (explicit cases)", async () => {
+  const flac = ts.tracks[0]!;
+  const src = readFileSync(flac.filePath!);
+  const size = src.length;
+  const url = await mediaUrl(flac.msgId);
+  for (const k of [2048, 7]) {
+    const res = await fetch(url, { headers: { range: `bytes=-${k}` } });
+    assert.equal(res.status, 206, `suffix -${k}`);
+    assert.equal(
+      res.headers.get("content-range"),
+      `bytes ${size - k}-${size - 1}/${size}`,
+      `suffix -${k}`,
+    );
+    const buf = Buffer.from(await res.arrayBuffer());
+    assert.deepEqual(buf, src.subarray(size - k, size), `suffix -${k} bytes`);
+  }
+});
+
+test("open-ended X- is byte-exact from X to EOF (explicit cases)", async () => {
+  const flac = ts.tracks[0]!;
+  const src = readFileSync(flac.filePath!);
+  const size = src.length;
+  const url = await mediaUrl(flac.msgId);
+  for (const start of [4096, size - 1]) {
+    const res = await fetch(url, { headers: { range: `bytes=${start}-` } });
+    assert.equal(res.status, 206, `open ${start}`);
+    assert.equal(
+      res.headers.get("content-range"),
+      `bytes ${start}-${size - 1}/${size}`,
+      `open ${start}`,
+    );
+    const buf = Buffer.from(await res.arrayBuffer());
+    assert.deepEqual(buf, src.subarray(start, size), `open ${start} bytes`);
+  }
+});
+
+test("zero suffix is 416; oversized suffix saturates to the whole file (RFC 7233)", async () => {
+  const flac = ts.tracks[0]!;
+  const src = readFileSync(flac.filePath!);
+  const size = src.length;
+  const url = await mediaUrl(flac.msgId);
+  const bad = await fetch(url, { headers: { range: "bytes=-0" } });
+  assert.equal(bad.status, 416);
+  assert.equal(bad.headers.get("content-range"), `bytes */${size}`);
+
+  const all = await fetch(url, { headers: { range: "bytes=-999999999" } });
+  assert.equal(all.status, 206, "suffix longer than the file yields all bytes");
+  assert.equal(all.headers.get("content-range"), `bytes 0-${size - 1}/${size}`);
+  const buf = Buffer.from(await all.arrayBuffer());
+  assert.deepEqual(buf, src);
+});
+
+test("FR-19 delta: same-token overlapping ranges run together", async () => {
+  const flac = ts.tracks[0]!;
+  const src = readFileSync(flac.filePath!);
+  const size = src.length;
+  const url = await mediaUrl(flac.msgId);
+  const mid = Math.floor(size / 2);
+  // First request spans most of the file ("0-5000000"), a mid-file tail probe
+  // runs WHILE it is still streaming — the player's normal interleaving. The
+  // same token owns both grants; the mid-file response must not abort the
+  // first one (old one-grant-per-token semantics would have failed here).
+  const first = fetch(url, { headers: { range: "bytes=0-5000000" } });
+  const second = fetch(url, { headers: { range: `bytes=${mid}-${mid + 100}` } });
+  const [r1, r2] = await Promise.all([first, second]);
+  const expectEnd = Math.min(5_000_000, size - 1);
+  assert.equal(r1.status, 206);
+  assert.equal(r1.headers.get("content-range"), `bytes 0-${expectEnd}/${size}`);
+  const buf1 = Buffer.from(await r1.arrayBuffer());
+  assert.equal(buf1.length, expectEnd + 1);
+  assert.deepEqual(buf1, src.subarray(0, expectEnd + 1));
+  assert.equal(r2.status, 206);
+  assert.equal(r2.headers.get("content-range"), `bytes ${mid}-${mid + 100}/${size}`);
+  const buf2 = Buffer.from(await r2.arrayBuffer());
+  assert.deepEqual(buf2, src.subarray(mid, mid + 101));
+});

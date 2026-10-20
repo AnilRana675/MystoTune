@@ -208,7 +208,7 @@ test("sign: art tokens are kind-tagged and cannot cross onto /media", () => {
 
 /* ------------------------------------------------- schema migration v1→v2 */
 
-test("db: schema v1 databases gain hasThumb on open (ALTER + version 2)", () => {
+test("db: schema v1 databases gain hasThumb on open (ALTER + version 3)", () => {
   const dir = mkdtempSync(path.join(__dirname, "..", "tmp-m4-migrate-"));
   try {
     const p = path.join(dir, "old.sqlite");
@@ -245,7 +245,7 @@ test("db: schema v1 databases gain hasThumb on open (ALTER + version 2)", () => 
     const cols = db2.prepare("PRAGMA table_info(tracks)").all() as Array<{ name: string }>;
     assert.ok(cols.some((c) => c.name === "hasThumb"), "hasThumb column restored");
     const ver = (db2.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value: string }).value;
-    assert.equal(ver, "2");
+    assert.equal(ver, "3");
     const row = getTrack(db2, seed.id);
     assert.ok(row, "row survived the migration");
     assert.equal(row?.hasThumb, 0); // default applies

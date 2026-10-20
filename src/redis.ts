@@ -25,6 +25,15 @@ const RATE_TTL_SEC = 60; // rl:{..} — 60 s bucket (§4.11)
 const SNAPSHOT_MAX_BYTES = 24 * 1024 * 1024; // free-tier safe guard
 const FLOOD_KEY = "flood:until";
 const SNAPSHOT_KEY = "index:snapshot";
+/** §4.15 Render profile: monthly streamed-bytes counter (UTC month TTL). */
+const BYTES_MONTH_KEY = "bytes:month";
+
+/** Seconds until the end of the current UTC month (min 60 so a month-end
+ * write still lands briefly). The counter self-resets at the month roll. */
+function monthEndTtlSec(now = new Date()): number {
+  const end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+  return Math.max(60, Math.ceil((end - now.getTime()) / 1000));
+}
 
 /** Minimal doc metadata cache payload (§4.4 table: ~200 B; no fileReference). */
 export interface ResolvedDocMeta {
@@ -75,6 +84,11 @@ export interface RedisStore {
   /* index snapshot (§4.11, ephemeral-disk hosts, REDIS_SNAPSHOT=1) */
   readSnapshot(): Promise<Buffer | null>;
   writeSnapshot(bytes: Buffer): void;
+
+  /* monthly egress budget (§4.15): streamed bytes this UTC month */
+  addBytesMonth(n: number): void;
+  /** Reads the counter; 0 on any failure/time-out (never blocks streaming). */
+  readBytesMonth(): Promise<number>;
 
   close(): void;
 }
@@ -216,6 +230,30 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
         if ((e as { code?: string })?.code === "REDIS_CMD_TIMEOUT") stats.timeouts += 1;
         else stats.errors += 1;
         return 0; // §4.11 rule 3: no Redis → local flood state keeps working
+      }
+    },
+
+    addBytesMonth(n) {
+      if (!Number.isFinite(n) || n <= 0) return;
+      void withTimeout(
+        (async () => {
+          const pipe = client.pipeline();
+          pipe.incrby(BYTES_MONTH_KEY, Math.floor(n)).expire(BYTES_MONTH_KEY, monthEndTtlSec());
+          await pipe.exec();
+        })(),
+        timeoutMs,
+      ).catch(() => undefined); // accounting only — never blocks playback (FR-15)
+    },
+
+    async readBytesMonth() {
+      try {
+        const v = await withTimeout(client.get(BYTES_MONTH_KEY), timeoutMs);
+        const n = Number(v ?? 0);
+        return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+      } catch (e) {
+        if ((e as { code?: string })?.code === "REDIS_CMD_TIMEOUT") stats.timeouts += 1;
+        else stats.errors += 1;
+        return 0;
       }
     },
 

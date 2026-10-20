@@ -2,7 +2,7 @@
 
 Revised against the official BitChord addon protocol (bitchord.kushagrasingh.in/docs) · October 19, 2026
 
-v2.1 moves the track index to SQLite on local disk and adds an optional free 30 MB Redis for small caches. Sections 4.11 to 4.13 set the storage rules, the VPS limits and the Node.js settings. Section 4.14 holds the Telegram-specific fixes from the pre-build review (v2.2), and sections 9 to 11 add the setup runbook, repository layout and success metrics.
+v2.1 moves the track index to SQLite on local disk and adds an optional free 30 MB Redis for small caches. Sections 4.11 to 4.13 set the storage rules, the VPS limits and the Node.js settings. Section 4.14 holds the Telegram-specific fixes from the pre-build review (v2.2), section 4.15 the Render free-plan profile, and sections 9 to 11 add the setup runbook, repository layout and success metrics.
 
 ## **0\. What was wrong in v1, and what changed**
 
@@ -68,8 +68,9 @@ Build a lightweight, self-hosted server that implements the BitChord addon proto
 | FR-16 | Resource limits | Enforce stream, chunk and cache caps so RSS stays within the 192 MB limit and near the 128 MB stretch target (section 4.12). Expose RSS and cache sizes on /healthz. | P0 |
 | FR-17 | Query handling | Sanitize free text before FTS5 so characters like \- " : \* never cause errors. Prefix-match tokens, AND first with an OR fallback. Parse quality case-insensitively. Clean junk from titles before matching (section 4.14). | P0 |
 | FR-18 | Readiness | /manifest.json and /search answer 200 while the index is building and when Telegram is unreachable. Only /stream and /media for a known track return 503 on a Telegram outage. | P0 |
-| FR-19 | Stream admission | Queue up to 2 s instead of rejecting. Count only requests actively streaming bytes. A new Range request for the same token replaces that token’s previous one. | P0 |
-| FR-20 | Session safety | One running instance per session string. On AUTH\_KEY\_DUPLICATED or AUTH\_KEY\_UNREGISTERED, log once, stop retrying, report unhealthy and exit. | P0 |
+| FR-19 | Stream admission | Queue up to 2 s instead of rejecting. Count only requests actively streaming bytes. A token may hold 2 concurrent requests, and a third aborts the oldest. | P0 |
+| FR-20 | Session safety | One running instance per session string. On AUTH\_KEY\_DUPLICATED or AUTH\_KEY\_UNREGISTERED, log once, stop retrying, report unhealthy and exit (on Render, retry at boot first, see section 4.15). | P0 |
+| FR-21 | Head-window cache | Extend the first-/stream probe (64 KB) to read the full first 512 KiB window and keep it in an LRU (8 entries, 5 min TTL, about 4 MB), so the next track starts from memory. Do not prefetch on every /stream, because BitChord may call it without playing. | P2 |
 
 ## **4\. Technical requirements**
 
@@ -149,7 +150,7 @@ The id must be stable across restarts and upgrades. An empty id is rejected. Opt
 **GET|HEAD /media/{token}** (not part of the protocol)
 
 * The token is base64url(payload).base64url(hmac), where payload \= { id, exp } and the HMAC uses MEDIA\_SIGNING\_KEY. Default TTL is 6 h (MEDIA\_URL\_TTL\_SECONDS), well above BitChord’s 5-minute stream cache.  
-* No Range header: 200, full Content-Length. With Range: bytes=X-Y or bytes=X-: 206 with Content-Range: bytes X-Y/TOTAL, Content-Length of the slice. Out-of-bounds: 416 with Content-Range: bytes \*/TOTAL.  
+* No Range header: 200, full Content-Length. With Range: bytes=X-Y or bytes=X-: 206 with Content-Range: bytes X-Y/TOTAL, Content-Length of the slice. Also support suffix ranges (bytes=-N, the last N bytes), which players use for ID3v1 tags and for M4A files with the moov atom at the end. Out-of-bounds: 416 with Content-Range: bytes \*/TOTAL.  
 * Always send Accept-Ranges: bytes, Content-Type (see 4.5), Cache-Control: private, max-age=300. HEAD returns the headers without a body.  
 * Expired or invalid token: 403. Never reveal which check failed.
 
@@ -271,7 +272,7 @@ Rules:
 2. Give every key a TTL except the snapshot, and cap q: entries at 500 so the cache cannot grow toward the limit.  
 3. If Redis is down or slow, fall back to a small in-process LRU and local counters. Never block playback on Redis.  
 4. Never store the session string, the signing key or audio bytes in Redis.  
-5. The sync cursor (last indexed message id per chat) is stored in SQLite. Redis is never its only copy.  
+5. The sync cursor (last indexed message id per chat) is stored in SQLite. Redis is never its only copy, except on hosts with an ephemeral disk (section 4.15), where the snapshot carries the cursors.  
 6. Check that the plan persists data across restarts before relying on the snapshot. Treat all other keys as disposable.
 
 **Ephemeral-disk hosts.** If the host wipes the filesystem on redeploy (some free tiers do), set REDIS\_SNAPSHOT=1. After each sync, write a gzip-compressed snapshot of the index to index:snapshot. On boot, restore it, then sync only messages newer than the cursor. With a persistent disk, mount ./data and skip the snapshot.
@@ -407,7 +408,7 @@ Players preload the next track, probe with short ranges and reopen connections o
 
 * Count only requests that are actively streaming bytes. HEAD requests and range probes of 4 KiB or less are free.  
 * Extra requests wait up to ADMISSION\_WAIT\_MS (default 2000), then get 503 with Retry-After: 2.  
-* A new Range request for the same token aborts that token’s previous request, so a seek storm never stacks up.
+* Allow up to 2 concurrent requests per token, because players often probe the file tail while playing. A third request aborts the oldest, so a seek storm never stacks up.
 
 **Telegram limits to verify in M2**
 
@@ -418,6 +419,39 @@ Players preload the next track, probe with short ranges and reopen connections o
 
 * The BitChord docs do not explicitly say a root URL with a secret path prefix (/\<ADDON\_SECRET\>) is accepted, though their checklist mentions path-based tokens. Test it in M0. If BitChord drops the prefix, fall back to a long random subdomain and rely on signed media URLs, so a leaked search URL exposes metadata only.  
 * Cloudflare’s proxy or tunnel may restrict large media traffic under its terms. Check them, or run Caddy directly on the VPS.
+
+**Seeks and next-track behaviour**
+
+* A mid-track start fetches only the 512 KiB window that contains the start byte. Earlier bytes are never downloaded.  
+* The addon caches no audio and does not prefetch the next track. If BitChord preloads, the addon simply sees another /stream call and a Range request on the new URL, which counts toward admission.  
+* FR-21 adds an optional head-window cache so the next track’s first byte comes from memory.  
+* VBR MP3 without a Xing or VBRI header can land a few seconds off after a seek. The player estimates the position, and the addon cannot fix it. FLAC seeks accurately.  
+* Test before shipping: bytes=X-, bytes=-N, and two overlapping requests on one token (a rate-limited 0-5000000 request must finish while a mid-file range runs).
+
+### **4.15 Render free-plan profile**
+
+Render’s free plan is a 512 MB container web service, not a VPS. It spins down after 15 minutes without inbound traffic and takes about a minute to wake. Its filesystem is wiped on every redeploy, restart and spin-down, and Render may restart it at any time. Free services share 750 instance hours per workspace each month, and they count against the plan’s outbound bandwidth. Reported bandwidth is 5 GB a month on the Hobby plan, though older pages say 100 GB, so check the dashboard and set the budget below from the real figure.
+
+| Constraint | What the addon does |
+| :---- | :---- |
+| Ephemeral disk | Set REDIS\_SNAPSHOT=1. After each sync, save the gzip index snapshot and the sync cursors to Redis. On boot, restore both before connecting to Telegram. This replaces the “cursor lives in SQLite” rule from 4.11. The compressed snapshot must fit the free Redis plan, so lower MAX\_INDEX\_ENTRIES if it does not. |
+| Cold start | Start Fastify first. /manifest.json and /search answer from the restored snapshot while Telegram connects (FR-18). /stream waits up to 10 s for the connection, then returns 503 with Retry-After. |
+| Port | Bind 0.0.0.0 and read PORT from the environment. Render injects it, and 8080 is only the local default. |
+| Idle spin-down | Choose one: accept cold starts, or ping /healthz every 10 minutes only while listening. A 24/7 pinger uses about 744 of the 750 monthly hours, so keep this the only free service in the workspace. |
+| Bandwidth | Set ALLOW\_DOWNLOADS=0. Add MONTHLY\_BYTES\_BUDGET, counted in Redis. Once it is exceeded, /stream returns 404, so BitChord falls back to another source before Render suspends the service. |
+| Deploy overlap | Old and new instances can briefly run together, which triggers AUTH\_KEY\_DUPLICATED on the same session. At boot, wait BOOT\_AUTH\_RETRY\_WAIT\_SECONDS and retry up to BOOT\_AUTH\_RETRIES times before exiting. Deploy while nobody is listening. |
+| Region | Pick Singapore, the nearest Render region. |
+| Second account | Run it only as an independent cold standby, with its own session string and its own entry in BitChord. Never load-balance between the two, and check Render’s terms before creating it. |
+
+Add these to the .env (leave PORT unset):
+
+REDIS\_URL=\<free Redis URL\>  
+REDIS\_SNAPSHOT=1  
+ALLOW\_DOWNLOADS=0  
+MONTHLY\_BYTES\_BUDGET=4500000000  
+BOOT\_AUTH\_RETRIES=3  
+BOOT\_AUTH\_RETRY\_WAIT\_SECONDS=60  
+The 4.12 and 4.13 memory settings still apply. The 512 MB container fits the 192 MB planning limit.
 
 ## **5\. Non-functional requirements**
 
@@ -494,6 +528,7 @@ Checklist adapted from the BitChord production list:
 | Audio sent as plain documents (often FLAC) | Tracks missing from search or without duration | Document scan plus FLAC header probe (section 4.6, FR-13). |
 | Free-account download throttling or protected-content channels | Slow first byte or refused downloads | Measure in M2 with a 50 MB+ FLAC. Skip and log channels that refuse downloads. |
 | Proxy or tunnel terms for media traffic | Hosting suspended or throttled | Check Cloudflare’s terms for audio traffic, or run Caddy directly on the VPS. |
+| Render free plan: hours or bandwidth exhausted | Services suspended until the next month | MONTHLY\_BYTES\_BUDGET with 404 fallback, downloads off, and only one free service per workspace (section 4.15). |
 
 ## **9\. Setup runbook**
 
@@ -523,7 +558,7 @@ test/           contract, range, query, admission, fault
 | Test | What it proves |
 | :---- | :---- |
 | Contract | Manifest, search and stream match the BitChord shapes (non-empty id, tracks, absolute url, 404 and 429 behaviour) |
-| Range | 50 random slices of an MP3 and a FLAC match the source bytes, including 200, 206 and 416 |
+| Range | 50 random slices of an MP3 and a FLAC match the source bytes, including 200, 206 and 416, plus open-ended (bytes=X-) and suffix (bytes=-N) ranges and two overlapping requests on one token, where the first must finish |
 | Query | Hostile strings (\-, quotes, colons, emoji, 10-word queries) return 200 and never an FTS error |
 | Admission | A seek storm during an active Download produces no 503 and no FloodWait |
 | Fault | Telegram drop, Redis down and AUTH\_KEY\_DUPLICATED behave as specified in FR-18 and FR-20 |
@@ -535,4 +570,4 @@ test/           contract, range, query, admission, fault
 * All 50 random seeks return correct bytes.  
 * Zero 5xx responses during a 30-minute soak with 2 players.  
 * A new track becomes searchable within SYNC\_INTERVAL\_MINUTES plus one minute.  
-* RSS stays within the 192 MB limit, and near 128 MB if the stretch target holds.
+* RSS stays within the 192 MB limit, and near 128 MB if the stretch target holds. Measure it against the live Telegram session, not fixtures: the fixture soak (102 MB peak RSS in Docker) excludes GramJS and Redis.

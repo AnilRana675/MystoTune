@@ -39,7 +39,7 @@ export type UpsertTrack = Omit<TrackRow, "rowid" | "addedAt"> & {
   addedAt?: number;
 };
 
-const SCHEMA_VERSION = "2";
+const SCHEMA_VERSION = "3";
 const FETCH_LIMIT = 200; // candidate pool before JS-side boost/dedupe (§4.17)
 
 export function openDb(dbPath: string): Database.Database {
@@ -85,12 +85,31 @@ export function createSchema(db: Database.Database): void {
       title, artist, album, fileName,
       tokenize = 'unicode61 remove_diacritics 2'
     );
+
+    CREATE TABLE IF NOT EXISTS sync_cursors (
+      chatId TEXT PRIMARY KEY,
+      minId  INTEGER NOT NULL
+    );
   `);
   // v1 → v2 migration: FR-12 hasThumb column on pre-M4 databases
   const cols = db.prepare("PRAGMA table_info(tracks)").all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === "hasThumb")) {
     db.exec("ALTER TABLE tracks ADD COLUMN hasThumb INTEGER NOT NULL DEFAULT 0");
   }
+  // v2 → v3 migration (TRD v2.2 FINAL §4.11 rule 5): per-chat cursors move
+  // from opaque meta rows ("cursor:{chatId}") into a real sync_cursors table
+  // so the Redis snapshot can reseed them verbatim on ephemeral-disk hosts.
+  const migrate = db.transaction(() => {
+    for (const r of db.prepare("SELECT key, value FROM meta WHERE key LIKE 'cursor:%'").all() as Array<{ key: string; value: string }>) {
+      const chatId = r.key.slice("cursor:".length);
+      db.prepare("INSERT OR IGNORE INTO sync_cursors(chatId, minId) VALUES(@chatId, @minId)").run({
+        chatId,
+        minId: Number(r.value) || 0,
+      });
+      db.prepare("DELETE FROM meta WHERE key = @key").run({ key: r.key });
+    }
+  });
+  migrate();
   const meta = db.prepare<{ v: string }>(
     "INSERT INTO meta(key, value) VALUES('schema_version', @v) ON CONFLICT(key) DO UPDATE SET value = @v",
   );
@@ -173,24 +192,24 @@ export function oldestTrackRowids(db: Database.Database, limit: number): Array<{
 }
 
 export function getCursor(db: Database.Database, chatId: number): number {
-  const row = stmts(db).getCursor.get({ key: `cursor:${chatId}` }) as { value: string } | undefined;
-  return row ? Number(row.value) : 0;
+  const row = stmts(db).getCursor.get({ chatId: String(chatId) }) as { minId: number } | undefined;
+  return row ? Number(row.minId) : 0;
 }
 
 export function setCursor(db: Database.Database, chatId: number, minId: number): void {
-  stmts(db).setCursor.run({ key: `cursor:${chatId}`, value: String(minId) });
+  stmts(db).setCursor.run({ chatId: String(chatId), minId });
 }
 
 /** Every stored sync cursor (used by the Redis snapshot export, §4.11). */
 export function listCursors(db: Database.Database): Array<{ chatId: number; cursor: number }> {
-  const rows = db.prepare("SELECT key, value FROM meta WHERE key LIKE 'cursor:%'").all() as Array<{
-    key: string;
-    value: string;
+  const rows = db.prepare("SELECT chatId, minId FROM sync_cursors").all() as Array<{
+    chatId: string;
+    minId: number;
   }>;
   const out: Array<{ chatId: number; cursor: number }> = [];
   for (const r of rows) {
-    const chatId = Number(r.key.slice("cursor:".length));
-    const cursor = Number(r.value);
+    const chatId = Number(r.chatId);
+    const cursor = Number(r.minId);
     if (Number.isFinite(chatId) && Number.isFinite(cursor)) out.push({ chatId, cursor });
   }
   return out;
@@ -486,10 +505,10 @@ function stmts(db: Database.Database): Statements {
       listIds: db.prepare("SELECT rowid, id FROM tracks ORDER BY rowid LIMIT @limit OFFSET @offset"),
       // newest-first: addedAt ascending selects the OLDEST rows for trimming past the cap
       oldestIds: db.prepare("SELECT rowid, id FROM tracks ORDER BY addedAt ASC, rowid ASC LIMIT @limit"),
-      getCursor: db.prepare("SELECT value FROM meta WHERE key = @key"),
+      getCursor: db.prepare("SELECT minId FROM sync_cursors WHERE chatId = @chatId"),
       setCursor: db.prepare(`
-        INSERT INTO meta(key, value) VALUES(@key, @value)
-        ON CONFLICT(key) DO UPDATE SET value = @value
+        INSERT INTO sync_cursors(chatId, minId) VALUES(@chatId, @minId)
+        ON CONFLICT(chatId) DO UPDATE SET minId = @minId
       `),
     };
     stmtCache.set(db, s);

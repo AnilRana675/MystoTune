@@ -9,7 +9,7 @@ src/            server.ts (routes, media proxy) · db.ts (SQLite+FTS5) · indexe
                 (track ids, metadata cleaning, §4.5 quality tiers) · telegram.ts ·
                 media.ts (ranges + admission control) · sign.ts (HMAC tokens) · config.ts
 scripts/        seed-fixture.ts · session.mjs (M1) · channels.mjs (M1)
-test/           contract/range/query/admission/fault/m1/m2/m3 suites + fake-redis + soak
+test/           contract/range/query/admission/fault/m1/m2/m3/m4 suites + fake-redis + soak
 ```
 
 ## Quick start (dev)
@@ -47,7 +47,12 @@ credential.
 
 `/media` honours `Range` (200/206/416), `If-Range`, optimistic `HEAD`,
 `ETag {docId}-{size}`, `Cache-Control: private, max-age=300`; ≤4 KiB probes and HEAD
-are admission-free (FR-19); new Range seeks abort the previous stream for the token.
+are admission-free (FR-19). Ranges are RFC 7233-complete for players: suffix
+`bytes=-N` and open-ended `bytes=X-` are byte-exact, `bytes=X-Y` clamps past EOF.
+Admission (FR-19 v2.2 FINAL): up to **two** concurrent streams per token (a player
+probing the tail while playing no longer kills playback) — the 3rd request for the
+same token aborts the *oldest* of the two; extra tokens queue up to
+`ADMISSION_WAIT_MS` (2 s) then answer `503` with `Retry-After: 2`.
 
 For **telegram-source** tracks (M2): `/stream` resolves the live message first and
 the `GET /media` byte bridge streams real `upload.GetFile` windows — 512 KiB-aligned
@@ -62,8 +67,8 @@ headers are committed, so cold/FloodWait/expired-reference failures surface as r
 ## Tests & soak
 
 ```bash
-npm test                        # 94 assertions across contract/range/query/admission/fault/m1/m2/m3/m4
-npm run soak -- --seconds 60 --out docs/m2-soak-baseline.json
+npm test                        # 105 assertions across contract/range/query/admission/fault/m1/m2/m3/m4
+npm run soak -- --seconds 60 --no-budget --out docs/m5-soak-baseline.json
 ```
 
 Baseline (M0, in-process fixtures, `NODE_OPTIONS` caps as in §4.12): 70 165 seek-storm
@@ -72,7 +77,11 @@ peak RSS 156 784 KiB (budget ≤ 192 MB hard / 128 MB stretch), heapUsed ≤ 27 
 max 2 active streams, 0 queued, no floods. Full JSON: `docs/m0-soak-baseline.json`
 (uncapped-dev comparison run kept at `docs/m0-soak-baseline-unbounded.json`).
 M2 re-run after the byte-bridge rework: 28 616 requests in 26 s, 0 × 5xx, p95 5 ms,
-peak RSS 147 620 KiB — `docs/m2-soak-baseline.json`.
+peak RSS 147 620 KiB — `docs/m2-soak-baseline.json`. M5 re-run under the FR-19
+two-per-token admission (`--no-budget`: the storm outpaces the default 4.5 GB
+monthly budget in ~15 s, which would otherwise flip /media to its §4.15 plain-404
+fallback mid-run): 28 527 requests in 60 s, **0 × 5xx**, served 7.9 GB, p50 4 ms /
+p95 9 ms, max 2 active / 0 queued, RSS 227 872 KiB — `docs/m5-soak-baseline.json`.
 
 M3 dockerized 30-minute compose soak (`compose.bench.yaml`, cgroup 192 m / 384 m,
 no Redis, no Telegram): 2 440 456 requests, **0 × 5xx / 0 × 429 / 0 errors**, served
@@ -132,3 +141,27 @@ stays the default image for its glibc `MALLOC_ARENA_MAX` support).
   `Lossless · ALAC` truthfully. SQLite FTS hygiene: `upsertTrack` purges the
   replaced rows' FTS docids so enrichment re-upserts cannot collide. Tests:
   94/94 across contract/range/query/admission/fault/m1/m2/m3/m4.
+- **M5 ✅ TRD v2.2 FINAL profile** — Render free-plan profile (§4.15) plus the
+  hardening deltas: admission (FR-19) now allows **two concurrent streams per
+  token** (player probes the tail while playing); a 3rd request for the same
+  token aborts the oldest stream, extra tokens queue up to `ADMISSION_WAIT_MS`
+  then 503 Retry-After 2. Head-window cache (FR-21): the first 512 KiB window
+  of every track is kept in an 8-entry / 5-minute LRU, so next-track first
+  bytes come from memory with no extra Telegram call. HTTP ranges are
+  RFC 7233-complete: suffix `bytes=-N` and open-ended `bytes=X-` are byte-exact
+  (covered by dedicated tests, incl. same-token overlapping ranges). Monthly
+  egress budget `MONTHLY_BYTES_BUDGET` (default 4 500 000 000) counts streamed
+  bytes in the Redis `bytes:month` counter (UTC-month TTL, fire-safe with a
+  local fallback) and makes both `/stream` and `/media` answer a **plain 404**
+  when exceeded — BitChord falls back and Render never suspends the service.
+  Cold start: Fastify boots first; Telegram-dependent requests wait up to 10 s
+  (`websocket:0s` order in the manifest) then 503 Retry-After 5. Deploy
+  overlap: `AUTH_KEY_DUPLICATED` at boot retried `BOOT_AUTH_RETRIES`×
+  `BOOT_AUTH_RETRY_WAIT_SECONDS` (3 × 60 s) before exiting. Storage rule
+  (§4.11 rule 5): cursors live in the SQLite `sync_cursors` table (schema v3)
+  and the Redis `index:snapshot` gzip also carries them, so `REDIS_SNAPSHOT=1`
+  ephemeral-disk hosts like Render rebuild tracks **and** sync cursors BEFORE
+  Telegram connects. Deploy guide: `docs/render.md`.
+  Tests: 105/105 across contract/range/query/admission/fault/m1/m2/m3/m4 (M5
+  cases live in range/admission/fault; the m4 migration test also asserts the
+  new schema v3).

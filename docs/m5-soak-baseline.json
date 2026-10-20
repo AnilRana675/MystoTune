@@ -1,0 +1,17 @@
+{
+  "durationSec": 60,
+  "workers": 2,
+  "requests": 28527,
+  "ok": 28527,
+  "fiveXX": 0,
+  "bytesServedMB": 7905.2,
+  "p50Ms": 4,
+  "p95Ms": 9,
+  "maxMs": 68,
+  "firstByteP95Ms": 7,
+  "maxActiveStreams": 2,
+  "maxQueued": 0,
+  "maxRssKiB": 227872,
+  "maxHeapUsedKiB": 29179,
+  "exitOk": true
+}

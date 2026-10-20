@@ -1,7 +1,8 @@
 /**
  * Minimal in-process RESP2 Redis for the M3 suite: no network dependency.
- * Supports the exact command subset src/redis.ts uses (PING/GET/SET/EXPIRE/
- * INCR/DEL) with binary-safe bulk payloads and lazily-swept expiries.
+ * Supports the exact command subset src/redis.ts uses (PING/GET/SET/SETEX/
+ * EXPIRE/INCR/INCRBY/DEL) with binary-safe bulk payloads and lazily-swept
+ * expiries.
  */
 import net from "node:net";
 
@@ -146,20 +147,22 @@ export async function startFakeRedis(): Promise<FakeRedisServer> {
         }
         return;
       }
-      case "INCR": {
+      case "INCR":
+      case "INCRBY": {
         const key = argv[0]?.toString("utf8") ?? "";
+        const by = name === "INCRBY" ? Number(argv[1]?.toString("utf8")) || 0 : 1;
         const e = data.get(key);
         if (!isLive(e, now)) {
-          data.set(key, { value: Buffer.from("1", "utf8"), expAt: null });
-          write(w, 1);
+          data.set(key, { value: Buffer.from(String(by), "utf8"), expAt: null });
+          write(w, by);
         } else {
           const n = Number(e!.value.toString("utf8"));
           if (!Number.isFinite(n)) {
             write(w, "!ERR value is not an integer or out of range");
             return;
           }
-          e!.value = Buffer.from(String(n + 1), "utf8");
-          write(w, n + 1);
+          e!.value = Buffer.from(String(n + by), "utf8");
+          write(w, n + by);
         }
         return;
       }
