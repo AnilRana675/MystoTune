@@ -13,6 +13,7 @@ import { once } from "node:events";
 
 import { RATE_LIMITS, applyStoredConfig, loadConfig, type AppConfig } from "./config";
 import { ConfigStore, DEFAULT_CONFIG_FILE } from "./configStore";
+import { deriveInstanceId, SessionLease } from "./lease";
 import {
   countTracks,
   createSchema,
@@ -114,6 +115,13 @@ export function createRateLimiter(): RateLimiter {
 
 /* ------------------------------------------------------------------ server */
 
+/** M6.1 service mode (doc 7.2): setup | standby | active | draining | failed. */
+export type AddonMode = "setup" | "standby" | "active" | "draining" | "failed";
+/** Mutable mode cell: the lease/main loop mutates `mode`, withServer reads it. */
+export interface AddonModeBox {
+  mode: AddonMode;
+}
+
 export interface BuildOptions {
   config: AppConfig;
   db: ReturnType<typeof openDb>;
@@ -121,9 +129,11 @@ export interface BuildOptions {
   indexer?: IndexIndexer;
   metrics?: Metrics;
   rateLimiter?: RateLimiter;
-  /** Optional Redis layer (§4.11) — search cache + health cache sizes. */
+  /** Original Redis layer (§4.11) — search cache + health cache sizes. */
   redis?: RedisStore | null;
   logLevel?: AppConfig["logLevel"];
+  /** M6.1 state machine cell (defaults to active for boots/tests without a lease). */
+  modeBox?: AddonModeBox;
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -145,6 +155,9 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
   const admissions = new Admissions(cfg.maxConcurrentStreams, cfg.admissionWaitMs);
   // §4.15 Render profile: monthly streamed-bytes budget (404 on exceed).
   const budget = new MonthlyBudget(cfg.monthlyBytesBudget, redisStore);
+  // M6.1 (doc 7.2): service state-machine mode cell (setup during the wizard,
+  // standby before the lease, draining on SIGTERM). Tests default to active.
+  const modeBox: AddonModeBox = opts.modeBox ?? { mode: "active" };
 
   const app = Fastify({
     logger: { level: opts.logLevel ?? cfg.logLevel },
@@ -265,6 +278,12 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     const q = (query.q ?? "").slice(0, 300);
     metrics.searches += 1;
 
+    // M6.1 (doc 7.2): SETUP serves a valid but empty index — the wizard runs
+    // while the addon is already discoverable by BitChord.
+    if (modeBox.mode === "setup") {
+      return jsonify(reply, { tracks: [] });
+    }
+
     // §4.11: q:{hash} cache (10 min TTL, capped 500) — hydrated by track id so
     // deleted rows simply drop out until the next miss refreshes the cache.
     let rows: TrackRow[] | null = null;
@@ -291,6 +310,11 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
 
   app.get("/:secret/stream/:id", async (req, reply) => {
     if (!secretOk((req.params as { secret?: string }).secret)) return reply.code(404).send({});
+    // M6.1 (doc 7.2): STANDBY (lease not yet held) and DRAINING (SIGTERM in
+    // flight) refuse new streams so the twin instance serves Telegram instead.
+    if (modeBox.mode === "standby" || modeBox.mode === "draining") {
+      return reply.code(503).header("retry-after", "5").send({});
+    }
     const guard = await limiter.take(`stream:${req.ip}`, RATE_LIMITS.streamPerMinute, Date.now());
     if (!guard.ok) {
       metrics.rateLimited += 1;
@@ -347,6 +371,10 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
   /* -------------------------------------------------------- /media/:token */
 
   const withMedia = async (req: FastifyRequest, reply: FastifyReply, method: "GET" | "HEAD") => {
+    // M6.1 (doc 7.2): refused while STANDBY or DRAINING (see /stream).
+    if (modeBox.mode === "standby" || modeBox.mode === "draining") {
+      return reply.code(503).header("retry-after", "5").send({});
+    }
     const token = (req.params as { token?: string }).token ?? "";
     const hit = verifyMediaToken(token, cfg.mediaSigningKey);
     if (!hit) return reply.code(403).send({}); // never disclose which check failed (§4.3)
@@ -656,6 +684,7 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     const mem = process.memoryUsage();
     return jsonify(reply, {
       ok: telegram.state !== "fatal",
+      mode: modeBox.mode, // M6.1 (doc 7.2): setup | standby | active | draining | failed
       uptimeSec: Math.round((Date.now() - metrics.since) / 1000),
       rss: kb(mem.rss),
       heapUsed: kb(mem.heapUsed),
@@ -864,7 +893,14 @@ export async function main(): Promise<void> {
 
   const telegram = new TelegramManager(cfg, redis);
   const indexer = new IndexIndexer(db, telegram, cfg, undefined, redis);
-  const app = buildServer({ config: cfg, db, telegram, indexer, redis });
+
+  // M6.1 (doc 7.2): BOOT picks SETUP (no session configured) or STANDBY
+  // (waiting for the lease). The server reads the same mutable cell, so all
+  // routes reflect the mode from the first request.
+  const modeBox: AddonModeBox = { mode: cfg.telegram.configured ? "standby" : "setup" };
+  let lease: SessionLease | null = null; // set below when Redis + session exist
+  let clearAcquire: () => void = () => {}; // stops the STANDBY poll on drain
+  const app = buildServer({ config: cfg, db, telegram, indexer, redis, modeBox });
   await app.listen({ port: cfg.port, host: "0.0.0.0" });
   app.log.info(`BitChord addon serving on :${cfg.port} (v${cfg.addonVersion})`);
 
@@ -878,20 +914,82 @@ export async function main(): Promise<void> {
     void e; // a down Redis must never block boot (§4.11 rule 3)
   }
 
-  // §4.15/FR-20 deploy overlap: retry AUTH_KEY_DUPLICATED at boot (above).
-  const bootState = await bootTelegram(telegram, cfg, app.log);
-  // §4.13: a fatal session must never keep the process alive
-  if (bootState === "fatal" || telegram.state === "fatal") {
-    app.log.error(`${telegram.detail} — run npm run session to re-provision; exiting`);
-    await app.close();
-    redis?.close();
-    process.exit(1);
-  }
-  indexer.start();
+  let draining = false;
+  // Re-read the mode cell through a call so TS narrowing can't assume it is
+  // stable across awaits (the lease loop and the drain handler mutate it).
+  const modeIs = (m: AddonMode): boolean => modeBox.mode === m;
 
+  /** STANDBY → ACTIVE: connect Telegram (overlap-retry), then start indexing. */
+  const goActive = async (): Promise<void> => {
+    if (modeIs("draining")) return;
+    const bootState = await bootTelegram(telegram, cfg, app.log);
+    if (modeIs("draining")) return; // SIGTERM raced the connect
+    if (bootState === "fatal" || telegram.state === "fatal") {
+      modeBox.mode = "failed";
+      app.log.error(`${telegram.detail} — run npm run session to re-provision; exiting`);
+      await app.close();
+      redis?.close();
+      process.exit(1);
+    }
+    indexer.start();
+    modeBox.mode = "active";
+    app.log.info("lease held — addon is active");
+  };
+
+  if (modeBox.mode === "setup") {
+    // M6.1 SETUP: valid manifest/empty search already served; the wizard (M6.2)
+    // transitions to STANDBY/ACTIVE once finish() persists the config.
+    app.log.warn("telegram session not configured — setup mode (no indexer)");
+  } else if (redis && cfg.telegram.configured) {
+    // M6.1 lease (doc 7.11): STANDBY polls tryAcquire; SELF-FENCE on lost lease.
+    lease = new SessionLease({
+      redis,
+      lease: cfg.lease,
+      instanceId: deriveInstanceId(process.env),
+      slot: 0,
+      onFenced: () => {
+        app.log.warn("redis lease lost (renewal misses) — self-fencing: telegram I/O stopped, STANDBY");
+        modeBox.mode = "standby";
+        indexer.stop();
+        void telegram.stop();
+      },
+    });
+    let acquireTimer: NodeJS.Timeout | null = null;
+    const leaseCb = lease;
+    acquireTimer = setInterval(() => {
+      if (draining) return;
+      void leaseCb.tryAcquire().then((held) => {
+        if (!held) return;
+        if (acquireTimer) clearInterval(acquireTimer);
+        acquireTimer = null;
+        void goActive();
+      });
+    }, cfg.lease.pollMs);
+    acquireTimer.unref();
+    clearAcquire = () => {
+      if (acquireTimer) clearInterval(acquireTimer);
+      acquireTimer = null;
+    };
+  } else {
+    // No Redis: M5 behaviour — no lease to arbitrate, connect immediately.
+    void goActive();
+  }
+
+  // M6.1 (doc 7.11): SIGTERM = DRAINING ≤ drainMs → release → exit.
   const stop = async () => {
+    if (draining) return;
+    draining = true;
+    modeBox.mode = "draining";
+    clearAcquire();
     indexer.stop();
+    const deadline = Date.now() + cfg.lease.drainMs;
+    const activeStreams = () => {
+      const a = (app as unknown as { admissions?: { activeCount: number } }).admissions;
+      return a?.activeCount ?? 0;
+    };
+    while (activeStreams() > 0 && Date.now() < deadline) await delayMs(100);
     await telegram.stop();
+    if (lease) await lease.release(); // compare-and-delete only our own slot
     await app.close();
     redis?.close();
     process.exit(0);

@@ -109,6 +109,7 @@ export async function startFakeRedis(): Promise<FakeRedisServer> {
         const key = argv[0]?.toString("utf8") ?? "";
         const tail = tokens.slice(3).map((t) => (Buffer.isBuffer(t) ? t.toString("utf8") : String(t)));
         let expAt: number | null = null;
+        let nx = false;
         for (let i = 0; i < tail.length; i++) {
           const opt = tail[i]?.toUpperCase();
           const n = Number(tail[i + 1]);
@@ -118,7 +119,13 @@ export async function startFakeRedis(): Promise<FakeRedisServer> {
           } else if (opt === "PX" && Number.isFinite(n)) {
             expAt = now + n;
             i += 1;
+          } else if (opt === "NX") {
+            nx = true;
           }
+        }
+        if (nx && isLive(data.get(key), now)) {
+          w.sock.write("$-1\r\n"); // nil: key already held, no overwrite
+          return;
         }
         data.set(key, { value: Buffer.from(argv[1] ?? Buffer.alloc(0)), expAt });
         write(w, "OK");
@@ -172,6 +179,34 @@ export async function startFakeRedis(): Promise<FakeRedisServer> {
           if (data.delete(a.toString("utf8"))) n += 1;
         }
         write(w, n);
+        return;
+      }
+      case "EVAL": {
+        // M6 lease scripts (Appendix A): compare-and-extend (pexpire) and
+        // compare-and-delete (del). Script sniff keeps the fake minimal.
+        const script = (argv[0] ?? Buffer.alloc(0)).toString("utf8");
+        const numkeys = Number(argv[1]?.toString("utf8")) || 0;
+        const keys = argv.slice(2, 2 + numkeys).map((k) => k.toString("utf8"));
+        const args = argv.slice(2 + numkeys).map((a) => a.toString("utf8"));
+        const key = keys[0] ?? "";
+        const e = data.get(key);
+        if (script.includes("pexpire")) {
+          // RENEW LES: holder compare, then PEXPIRE ttl(ms)
+          if (isLive(e, now) && e!.value.toString("utf8") === args[0]) {
+            e!.expAt = now + (Number(args[1]) || 0);
+            write(w, 1);
+          } else write(w, 0);
+          return;
+        }
+        if (script.includes("del")) {
+          // RELEASE LES: holder compare, then DEL
+          if (isLive(e, now) && e!.value.toString("utf8") === args[0]) {
+            data.delete(key);
+            write(w, 1);
+          } else write(w, 0);
+          return;
+        }
+        write(w, "!ERR unsupported script");
         return;
       }
       case "QUIT":

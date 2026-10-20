@@ -67,7 +67,7 @@ headers are committed, so cold/FloodWait/expired-reference failures surface as r
 ## Tests & soak
 
 ```bash
-npm test                        # 117 assertions across contract/range/query/admission/fault/m1/m2/m3/m4/m6
+npm test                        # 124 assertions across contract/range/query/admission/fault/m1/m2/m3/m4/m6
 npm run soak -- --seconds 60 --no-budget --out docs/m5-soak-baseline.json
 ```
 
@@ -179,4 +179,21 @@ stays the default image for its glibc `MALLOC_ARENA_MAX` support).
   `applyStoredConfig`; `PROFILE` autodetects `render` when `RENDER=true`;
   `PUBLIC_BASE_URL` falls back to `RENDER_EXTERNAL_URL`; new envs
   `SETUP_ENABLED`, `LEASE_TTL_MS`/`LEASE_RENEW_MS`/`LEASE_POLL_MS`/`DRAIN_MS`/
-  `SESSION_SLOTS`. Tests: 117/117 incl. new `test/m6.test.ts`.
+  `SESSION_SLOTS`. Tests: 117/117 incl. new `test/m6.test.ts`. (Incremented to
+  124 by M6.1 below.)
+- **M6.1 ✅ session lease + service modes (M6 spec §7.11/§7.2/Appendix A)** —
+  Redis lease `lease:session:{slot}`: acquire via `SET NX PX 45 s`, STANDBY
+  polls every 5 s, owner id = `RENDER_INSTANCE_ID` else hostname+4 random hex —
+  two instances can never share one Telegram session. Renew every 15 s via
+  compare-and-extend Lua (Appendix A verbatim); sustained failures for 30 s
+  self-fence (stop Telegram I/O, drop back to STANDBY); SIGTERM enters
+  DRAINING, finishing active streams ≤ 10 s, then compare-and-delete release.
+  Service state machine in the server (`AddonModeBox`): BOOT → SETUP (valid
+  manifest + empty search + healthz `mode:setup`, no indexer; wizard ships in
+  M6.2) → STANDBY (manifest/search from snapshot; `/stream` and `/media`
+  answer 503 Retry-After 5; `/healthz` stays 200 so Render keeps the old
+  instance until the new one passes) → ACTIVE (lease held + Telegram ready) →
+  DRAINING → FAILED. Without Redis an explicit-session boot keeps the M5
+  AUTH_KEY_DUPLICATED retry fallback. Tests: 124/124 incl. fake-Redis
+  two-instance lease races, Appendix A Lua ownership checks, self-fence, and
+  every mode gate.

@@ -100,6 +100,12 @@ export interface RedisStore {
    * configStore.save() via read-back). */
   writeConfigBlob(blob: string): void;
 
+  /* M6 session lease (doc 7.11): NX acquire + Lua compare-and-extend/-delete */
+  /** SET key value PX ttl NX — true only when the key was fresh acquired. */
+  setIfAbsent(key: string, value: string, ttlMs: number): Promise<boolean>;
+  /** EVAL a Lua script (Appendix A renew/release); 0 on miss, -1 on failure. */
+  evalLua(script: string, keys: string[], args: string[]): Promise<number>;
+
   close(): void;
 }
 
@@ -281,6 +287,31 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
     writeConfigBlob(blob) {
       if (typeof blob !== "string" || blob.length === 0) return;
       void withTimeout(client.set(CONFIG_STORE_KEY, blob), timeoutMs).catch(() => undefined);
+    },
+
+    /** M6 lease acquire (doc 7.11): SET NX PX — true only when freshly held. */
+    async setIfAbsent(key, value, ttlMs) {
+      try {
+        const res = await withTimeout(client.set(key, value, "PX", Math.floor(ttlMs), "NX"), timeoutMs);
+        return res === "OK";
+      } catch (e) {
+        if ((e as { code?: string })?.code === "REDIS_CMD_TIMEOUT") stats.timeouts += 1;
+        else stats.errors += 1;
+        return false; // never act as if the lease was taken on a failed probe
+      }
+    },
+
+    /** M6 lease renew/release (doc 7.11 + Appendix A). 0 on miss, -1 on error. */
+    async evalLua(script, keys, args) {
+      try {
+        const v = await withTimeout(client.eval(script, keys.length, ...keys, ...args), timeoutMs);
+        const n = Number(v ?? 0);
+        return Number.isFinite(n) ? n : 0;
+      } catch (e) {
+        if ((e as { code?: string })?.code === "REDIS_CMD_TIMEOUT") stats.timeouts += 1;
+        else stats.errors += 1;
+        return -1; // "unknown" — the caller's miss-streak logic self-fences
+      }
     },
 
     async getDocMeta(id) {

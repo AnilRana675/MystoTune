@@ -11,7 +11,7 @@ import type Database from "better-sqlite3";
 import { loadConfig, type AppConfig } from "../src/config.js";
 import { openDb, createSchema, countTracks, type TrackRow } from "../src/db.js";
 import { TelegramManager } from "../src/telegram.js";
-import { buildServer, type RateLimiter } from "../src/server.js";
+import { buildServer, type AddonModeBox, type RateLimiter } from "../src/server.js";
 import type { Admissions } from "../src/media.js";
 import type { Metrics } from "../src/server.js";
 import { openRedisStore, type RedisStore } from "../src/redis.js";
@@ -62,6 +62,8 @@ export async function buildTestServer(
     rateLimiter?: RateLimiter;
     /** attach the store to the TelegramManager as main() does (M3 flood/doc) */
     telegramRedis?: boolean;
+    /** M6.1: inject a service-mode cell (standby/setup/draining route tests). */
+    modeBox?: AddonModeBox;
     /** passthrough env overrides (M5: MONTHLY_BYTES_BUDGET, BOOT_AUTH_*...) */
     extraEnv?: Record<string, string | undefined>;
   } = {},
@@ -99,6 +101,7 @@ export async function buildTestServer(
     telegram,
     redis,
     rateLimiter: overrides.rateLimiter,
+    modeBox: overrides.modeBox,
   }) as AugmentedApp;
   await app.listen({ port, host: "127.0.0.1" });
   const baseUrl = `http://127.0.0.1:${port}`;

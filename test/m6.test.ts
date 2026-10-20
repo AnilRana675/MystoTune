@@ -22,6 +22,11 @@ import {
   isUrlSafeSecret,
   KeyDerivationError,
 } from "../src/keys.js";
+import { RELEASE_LUA, RENEW_LUA, deriveInstanceId, SessionLease } from "../src/lease.js";
+import { openRedisStore, type RedisStore } from "../src/redis.js";
+import { startFakeRedis } from "./fake-redis.js";
+import { buildTestServer, TEST_SECRET } from "./util.js";
+import { createMediaToken } from "../src/sign.js";
 import {
   ConfigStore,
   ConfigStoreError,
@@ -31,7 +36,6 @@ import {
   type StoredConfigV1,
 } from "../src/configStore.js";
 import { applyStoredConfig, ConfigError, loadConfig } from "../src/config.js";
-import type { RedisStore } from "../src/redis.js";
 
 const SEED_A = Buffer.alloc(32, 0x11);
 const SEED_B = Buffer.alloc(32, 0x22);
@@ -272,4 +276,152 @@ test("config: RENDER_EXTERNAL_URL fills the public base URL", () => {
     PUBLIC_BASE_URL: "https://custom.example.com",
   } as NodeJS.ProcessEnv);
   assert.equal(explicit.publicBaseUrl, "https://custom.example.com");
+});
+
+/* ===================== M6.1 session lease (doc 7.11/Appendix A) ===================== */
+
+const LEASE_INTERVALS = { ttlMs: 60_000, renewMs: 15_000, pollMs: 5_000 } as const;
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+async function waitUp(store: RedisStore, deadlineMs = 2500): Promise<void> {
+  const end = Date.now() + deadlineMs;
+  while (Date.now() < end) {
+    if (store.status() === "up") return;
+    await sleep(25);
+  }
+  throw new Error("fake redis never became ready");
+}
+
+test("lease: acquire is exclusive (SET NX PX); owner release frees the slot", async () => {
+  const fake = await startFakeRedis();
+  const redis = openRedisStore({ url: fake.url, timeoutMs: 500, snapshot: false })!;
+  await waitUp(redis);
+  await waitUp(redis);
+  try {
+    const a = new SessionLease({ redis, lease: LEASE_INTERVALS, instanceId: "inst-a", slot: 0 });
+    const b = new SessionLease({ redis, lease: LEASE_INTERVALS, instanceId: "inst-b", slot: 0 });
+    assert.equal(await a.tryAcquire(), true);
+    assert.equal(await b.tryAcquire(), false, "second instance must lose the race");
+    assert.equal(await a.release(), true, "owner release is compare-and-delete");
+    assert.equal(await a.release(), false, "already released — nothing to delete");
+    assert.equal(await b.tryAcquire(), true, "freed slot acquirable");
+    assert.equal(await b.release(), true);
+  } finally {
+    redis.close();
+    await fake.stop();
+  }
+});
+
+test("lease: Appendix A renew/release Lua compare the holder exactly", async () => {
+  const fake = await startFakeRedis();
+  const redis = openRedisStore({ url: fake.url, timeoutMs: 500, snapshot: false })!;
+  await waitUp(redis);
+  try {
+    const lease = new SessionLease({ redis, lease: LEASE_INTERVALS, instanceId: "inst-a", slot: 0 });
+    assert.equal(await lease.tryAcquire(), true);
+    // foreign renew must not extend the lease (still counts as a miss inside the class)
+    assert.equal(await redis.evalLua(RENEW_LUA, [lease.key], ["inst-b", "123456"]), 0);
+    assert.equal(await redis.evalLua(RENEW_LUA, [lease.key], ["inst-a", "123456"]), 1);
+    // foreign release must be a no-op
+    assert.equal(await redis.evalLua(RELEASE_LUA, [lease.key], ["inst-b"]), 0);
+    assert.equal(await redis.evalLua(RELEASE_LUA, [lease.key], ["inst-a"]), 1);
+  } finally {
+    redis.close();
+    await fake.stop();
+  }
+});
+
+test("lease: self-fences after sustained renewal misses and fires onFenced", async () => {
+  const fake = await startFakeRedis();
+  const redis = openRedisStore({ url: fake.url, timeoutMs: 500, snapshot: false })!;
+  await waitUp(redis);
+  try {
+    let fencedCalls = 0;
+    const lease = new SessionLease({
+      redis,
+      lease: LEASE_INTERVALS,
+      instanceId: "inst-a",
+      slot: 0,
+      // allowed misses = ceil(30_000 / 15_000) = 2
+      onFenced: () => {
+        fencedCalls += 1;
+      },
+    });
+    assert.equal(await lease.tryAcquire(), true);
+    // the twin force-deletes our lease (simulating loss without our release)
+    assert.equal(await redis.evalLua(RELEASE_LUA, [lease.key], ["inst-a"]), 1);
+    await lease.renewBeat(); // miss 1/2 — still held
+    assert.equal(lease.isFenced, false);
+    await lease.renewBeat(); // miss 2/2 — self-fence fires
+    assert.equal(lease.isFenced, true);
+    assert.equal(lease.isHeld, false);
+    assert.equal(fencedCalls, 1);
+    assert.equal(await lease.tryAcquire(), false, "fenced lease never re-acquires");
+  } finally {
+    redis.close();
+    await fake.stop();
+  }
+});
+
+test("lease: instance id is RENDER_INSTANCE_ID or a unique host fallback", () => {
+  assert.equal(deriveInstanceId({ RENDER_INSTANCE_ID: "rend-xyz" }), "rend-xyz");
+  assert.equal(deriveInstanceId({ RENDER_INSTANCE_ID: "  rend-xyz  " }), "rend-xyz");
+  const a = deriveInstanceId({});
+  const b = deriveInstanceId({});
+  assert.ok(/^[a-z0-9-]+-[0-9a-f]{4}$/.test(a), `host fallback shaped: ${a}`);
+  assert.notEqual(a, b, "fallback ids must not collide across boots");
+});
+
+/* ===================== M6.1 mode gates (doc 7.2) ===================== */
+
+test("standby: /stream + /media 503 retry-after 5; /search still serves the index", async () => {
+  const ts = await buildTestServer({ modeBox: { mode: "standby" } });
+  try {
+    const stream = await fetch(`${ts.baseUrl}/${TEST_SECRET}/stream/1`);
+    assert.equal(stream.status, 503);
+    assert.equal(stream.headers.get("retry-after"), "5");
+    const mediaToken = createMediaToken(String(ts.tracks[0]!.id), ts.cfg.mediaSigningKey, 600);
+    const media = await fetch(`${ts.baseUrl}/media/${mediaToken}`);
+    assert.equal(media.status, 503);
+    assert.equal(media.headers.get("retry-after"), "5");
+    const search = await fetch(`${ts.baseUrl}/${TEST_SECRET}/search?q=midnight`);
+    assert.equal(search.status, 200);
+    const body = (await search.json()) as { tracks: unknown[] };
+    assert.ok(body.tracks.length > 0, "standby serves the snapshot index");
+    const healthz = (await (await fetch(`${ts.baseUrl}/healthz`)).json()) as { mode: string; ok: boolean };
+    assert.equal(healthz.mode, "standby");
+    assert.equal(healthz.ok, true, "STANDBY /healthz MUST stay 200-ok (Render gate)");
+  } finally {
+    await ts.cleanup();
+  }
+});
+
+test("setup: /search is valid but empty; healthz reports mode setup", async () => {
+  const ts = await buildTestServer({ modeBox: { mode: "setup" } });
+  try {
+    const search = await fetch(`${ts.baseUrl}/${TEST_SECRET}/search?q=midnight`);
+    assert.equal(search.status, 200);
+    const body = (await search.json()) as { tracks: unknown[] };
+    assert.deepEqual(body.tracks, []);
+    const manifest = await fetch(`${ts.baseUrl}/${TEST_SECRET}/manifest.json`);
+    assert.equal(manifest.status, 200, "SETUP manifest stays valid for discovery");
+    const healthz = (await (await fetch(`${ts.baseUrl}/healthz`)).json()) as { mode: string; indexing: boolean };
+    assert.equal(healthz.mode, "setup");
+  } finally {
+    await ts.cleanup();
+  }
+});
+
+test("draining: /stream 503 retry-after 5 (SIGTERM window)", async () => {
+  const ts = await buildTestServer({ modeBox: { mode: "draining" } });
+  try {
+    const res = await fetch(`${ts.baseUrl}/${TEST_SECRET}/stream/1`);
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get("retry-after"), "5");
+    const healthz = (await (await fetch(`${ts.baseUrl}/healthz`)).json()) as { mode: string };
+    assert.equal(healthz.mode, "draining");
+  } finally {
+    await ts.cleanup();
+  }
 });
