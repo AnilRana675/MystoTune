@@ -67,8 +67,10 @@ async function main() {
     console.log(`\n=== ${entry.image} ===`);
     await run(`docker rm -f ${name} 2>/dev/null || true`);
     const started = await run(
+      // tmpfs default perms are root:root 0755 on this daemon — the image's
+      // `node` user (uid 1000) needs explicit uid/gid or sqlite gets EACCES.
       `docker run -d --name ${name} --memory 192m --memory-swap 384m --init ` +
-        `--tmpfs /tmp --tmpfs /data:rw,size=64m --tmpfs /app/test ` +
+        `--tmpfs /tmp:rw,uid=1000,gid=1000 --tmpfs /data:rw,uid=1000,gid=1000,size=64m --tmpfs /app/test:rw,uid=1000,gid=1000 ` +
         `-p ${HOST_PORT}:8080 ` +
         `-e PORT=8080 -e DB_PATH=/data/index.sqlite ` +
         `-e PUBLIC_BASE_URL=${BASE} -e ALLOW_INSECURE_BASE_URL=1 ` +

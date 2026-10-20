@@ -112,6 +112,10 @@ options) are safe — the wizard rewrites `cfg:v1`.
   inbound traffic. On wake, the boot order runs again: server first,
   snapshot restore, then Telegram. Expect normal `503` cold-start
   replies for up to 10 s.
+- **Local Docker note (M6):** with Docker ≥ 29 the tmpfs mounts default
+  to root:root 0755, so a `--tmpfs /data` (or `/app/test`) run with the
+  image's unprivileged user needs `rw,uid=1000,gid=1000` or sqlite gets
+  EACCES at open. `scripts/docker-bench.mjs` already does this.
 - **Storage is ephemeral** on the web service: `REDIS_SNAPSHOT=1` is what
   makes cold starts warm, and the encrypted `cfg:v1` in the Key Value
   store is why a re-deploy alone never loses the wizard's work. If the
@@ -159,6 +163,10 @@ options) are safe — the wizard rewrites `cfg:v1`.
 - [x] Deploy button link: `https://render.com/deploy?repo=https://github.com/AnilRana675/MystoTune`
 - [x] README Quick Start rewritten — deploy-first, no terminal
 - [x] Free Key Value plan exists (per Render plans; re-check before sign-off)
+- [x] M5 soak follow-up closed (doc §13): the odd 227 MB reading was the
+  in-process harness itself (tsx + load generator in the app process);
+  the 192 MiB-cgroup Docker re-run with all M4–M6 additions peaks at
+  63 MB cgroup / ~115 MB process RSS — `docs/m6-docker-benchmark.json`.
 - [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)
 - [ ] Play one MP3 and one FLAC from the deployed instance
 - [ ] Five consecutive redeploys without `AUTH_KEY_DUPLICATED` (the lease

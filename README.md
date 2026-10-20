@@ -116,6 +116,14 @@ two-per-token admission (`--no-budget`: the storm outpaces the default 4.5 GB
 monthly budget in ~15 s, which would otherwise flip /media to its §4.15 plain-404
 fallback mid-run): 28 527 requests in 60 s, **0 × 5xx**, served 7.9 GB, p50 4 ms /
 p95 9 ms, max 2 active / 0 queued, RSS 227 872 KiB — `docs/m5-soak-baseline.json`.
+That 227 MB number is a harness artifact, not the service: `test/soak.ts` runs the
+server in-process under tsx, so `/healthz` RSS counts the load generator and the
+TS loader (the same sample showed heapUsed ≈ 29 MB). M6 verdict re-run (doc §13):
+the Docker bench (`scripts/docker-bench.mjs`, 192 MiB cgroup, load from the host)
+with every M4–M6 addition says slim + alpine both peak at **63 MB cgroup /
+~115 MB process RSS / 30 MB heap**, 64 k requests, 0 × 5xx, p95 12 ms —
+`docs/m6-docker-benchmark.json`. The 192 MB planning limit stands; the in-process
+soak stays for regression trends only.
 
 M3 dockerized 30-minute compose soak (`compose.bench.yaml`, cgroup 192 m / 384 m,
 no Redis, no Telegram): 2 440 456 requests, **0 × 5xx / 0 × 429 / 0 errors**, served
