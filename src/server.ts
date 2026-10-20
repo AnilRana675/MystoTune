@@ -1130,6 +1130,10 @@ async function makeGramJSLoginFactory(): Promise<LoginFactory> {
           new ApiNs.messages.Search({
             peer: new ApiNs.InputPeerChannel({ channelId: bigInt(peer.channelId), accessHash: bigInt(peer.accessHash) }),
             filter: new ApiNs.InputMessagesFilterMusic(),
+            // q is REQUIRED in the TL schema; empty string + music filter =
+            // "all audio". iterMessages fills this for the indexer; here it
+            // must be explicit or Telegram-side validation throws CastError.
+            q: "",
             limit: 1,
             hash: bigInt(0),
           }),

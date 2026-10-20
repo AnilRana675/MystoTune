@@ -145,6 +145,7 @@ options) are safe — the wizard rewrites `cfg:v1`.
 | Fatal in logs (`AUTH_KEY_UNREGISTERED`, session invalid) | Session revoked/expired | `mode: "failed"`; setup re-opens with a banner and a **new token in the logs** |
 | `AUTH_KEY_DUPLICATED` in logs at boot | Two instances shared one session | M6: transient at overlap, boot retries absorb it; persistent ⇒ file an issue with boot logs |
 | Verify row `telegram` red / flood errors | Telegram rate limits or flagged a data-centre login | Wait (flood_wait surfaces with Retry-After); worst case log in locally and paste the session string into the wizard or env (§13) |
+| `Error: TIMEOUT … updates.js _updateLoop` repeating | GramJS update-loop RPC retries timing out — free-plan network latency, not our request paths | Benign noise: the service and indexer keep running; no action. The updater retries independently |
 
 ## Session hygiene
 
