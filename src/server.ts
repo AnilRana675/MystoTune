@@ -7,7 +7,7 @@
  * rows resolve via TelegramManager (503 until the GramJS iterator lands in
  * M2), manifest/search/healthz work with Telegram down or unconfigured (FR-18).
  */
-import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
+import Fastify, { LogController, type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 
@@ -148,7 +148,9 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
   const app = Fastify({
     logger: { level: opts.logLevel ?? cfg.logLevel },
     trustProxy: true,
-    disableRequestLogging: true, // FSTDEP023 deprecation is fine for node5-era; M3 moves to logController
+    // fastify 5.6 replacement for the deprecated top-level `disableRequestLogging`:
+    // built-in request logs stay off; our own onRequest/onResponse redaction hooks keep working.
+    logController: new LogController({ disableRequestLogging: true }),
     exposeHeadRoutes: false,
     bodyLimit: 64 * 1024,
     routerOptions: { maxParamLength: 512 }, // signed media tokens exceed the 100-char default

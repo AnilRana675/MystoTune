@@ -9,8 +9,8 @@
   },
   "scripts": {
     "build": "tsc -p .",
-    "start": "node dist/src/server.js",
-    "dev": "tsx src/server.ts",
+    "start": "node --disable-warning=ExperimentalWarning --disable-warning=TimeoutNegativeWarning dist/src/server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --disable-warning=TimeoutNegativeWarning --import tsx src/server.ts",
     "seed": "tsx scripts/seed-fixture.ts",
     "session": "node scripts/session.mjs",
     "channels": "node scripts/channels.mjs",

@@ -350,6 +350,14 @@ export class TelegramManager {
       const mod = await import("telegram");
       const StringSession = mod.sessions.StringSession;
       api = mod.Api;
+      // gramJS prints its version banner at INFO from the client constructor's
+      // own logger; hand it an error-level baseLogger so the banner (and any
+      // other library INFO chatter) never surfaces (§4.13 log hygiene).
+      const { Logger, LogLevel } = (await import("telegram/extensions/Logger.js")) as unknown as {
+        Logger: { new (level?: string): never };
+        LogLevel: { ERROR: string };
+      };
+      const log = new Logger(LogLevel.ERROR);
       client = new mod.TelegramClient(
         new StringSession(this.cfg.telegram.session ?? ""),
         this.cfg.telegram.apiId ?? 0,
@@ -359,6 +367,7 @@ export class TelegramManager {
           retryDelay: 2000,
           autoReconnect: true,
           floodSleepThreshold: 0, // §4.13: never sleep; throw FLOOD_WAIT and gate
+          baseLogger: log,
         },
       );
       client.setLogLevel("error" as unknown as Parameters<typeof client.setLogLevel>[0]); // §4.13: log level error

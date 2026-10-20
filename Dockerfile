@@ -35,4 +35,4 @@ USER node
 EXPOSE 8080
 VOLUME ["/data"]
 # rootDir "." compiles to dist/src/server.js (also see package.json start)
-CMD ["node", "dist/src/server.js"]
+CMD ["node", "--disable-warning=ExperimentalWarning", "--disable-warning=TimeoutNegativeWarning", "dist/src/server.js"]
