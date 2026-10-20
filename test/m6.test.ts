@@ -25,8 +25,9 @@ import {
 import { RELEASE_LUA, RENEW_LUA, deriveInstanceId, SessionLease } from "../src/lease.js";
 import { openRedisStore, type RedisStore } from "../src/redis.js";
 import { startFakeRedis } from "./fake-redis.js";
-import { buildTestServer, TEST_SECRET } from "./util.js";
+import { buildTestServer, TEST_SECRET, type TestServer } from "./util.js";
 import { createMediaToken } from "../src/sign.js";
+import { SetupAccess, type LoginCallbacks, type LoginFactory, type SetupChannel, type SetupLogin } from "../src/setup.js";
 import {
   ConfigStore,
   ConfigStoreError,
@@ -421,6 +422,489 @@ test("draining: /stream 503 retry-after 5 (SIGTERM window)", async () => {
     assert.equal(res.headers.get("retry-after"), "5");
     const healthz = (await (await fetch(`${ts.baseUrl}/healthz`)).json()) as { mode: string };
     assert.equal(healthz.mode, "draining");
+  } finally {
+    await ts.cleanup();
+  }
+});
+
+/* ===================== M6.2 guided setup (doc 7.5-7.9, §8) ===================== */
+
+const CRED_API_HASH = "a".repeat(32);
+
+type StatusPayload = {
+  closed: boolean;
+  creds: boolean;
+  loginPhase: string | null;
+  sentCodeTo: string | null;
+  loginError: { code: string; message: string; next: string } | null;
+  user: { id: number; name: string } | null;
+  channels: number[];
+  options: { allowDownloads: boolean; monthlyBytesBudget: number };
+  verify: { rows: Array<{ id: string; ok: boolean; severity: string; detail: string }>; finishAllowed: boolean } | null;
+  publicUrl: string | null;
+};
+
+async function statusOf(ts: TestServer): Promise<StatusPayload> {
+  const res = await fetch(`${ts.baseUrl}/${TEST_SECRET}/status`);
+  assert.equal(res.status, 200);
+  return (await res.json()) as StatusPayload;
+}
+
+/** Poll /status until `check` holds (2 s cap) — the login advances async. */
+async function untilStatus(ts: TestServer, check: (s: StatusPayload) => boolean): Promise<StatusPayload> {
+  const end = Date.now() + 2000;
+  for (;;) {
+    const s = await statusOf(ts);
+    if (check(s)) return s;
+    if (Date.now() > end) throw new Error("status precondition never reached");
+    await sleep(5);
+  }
+}
+
+/** Exchange the deploy-log token for the wizard session (doc 7.5). */
+async function unlockWizard(ts: TestServer): Promise<{ auth: { cookie: string; "x-setup-csrf": string }; csrf: string }> {
+  const res = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/unlock`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: ts.setupAccess!.token }),
+  });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { ok: boolean; csrf: string };
+  assert.equal(body.ok, true);
+  assert.ok(body.csrf.length > 0, "csrf token minted");
+  const cookie = (res.headers.get("set-cookie") ?? "").split(";")[0]!;
+  return { auth: { cookie, "x-setup-csrf": body.csrf }, csrf: body.csrf };
+}
+
+async function setupPost(ts: TestServer, auth: Record<string, string>, subpath: string, body: unknown): Promise<Response> {
+  return fetch(`${ts.baseUrl}/${TEST_SECRET}/setup${subpath}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth },
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * Telegram seam mock (doc 7.6/§10): every client.start() attempt behaves like
+ * a 2FA account with the doc's GramJS error names surfacing through wrong
+ * code/password submissions.
+ */
+class ScriptedLogin implements SetupLogin {
+  loginAttempts = 0;
+  /** tests flip this before verify() to make the channels check fail */
+  readable = true;
+  closeCount = 0;
+
+  start(cb: LoginCallbacks): Promise<{ id: number; name: string }> {
+    this.loginAttempts += 1;
+    return cb.phone().then(() =>
+      cb.code().then((code) => {
+        if (code === "0000") {
+          throw new Error("RPCError PHONE_CODE_INVALID: the code is invalid");
+        }
+        return cb.password().then((pw) => {
+          if (pw === "nope") {
+            throw new Error("RPCError PASSWORD_HASH_INVALID: the password is invalid");
+          }
+          return { id: 7, name: "Test User" };
+        });
+      }),
+    );
+  }
+
+  whoAmI(): Promise<{ id: number; name: string }> {
+    return Promise.resolve({ id: 7, name: "Test User" });
+  }
+
+  dialogs(): Promise<SetupChannel[]> {
+    return Promise.resolve([{ id: -100123, title: "Music" }]);
+  }
+
+  audioCount(): Promise<{ count: number; total: number }> {
+    return Promise.resolve({ count: 12, total: 99 });
+  }
+
+  channelReadable(): Promise<boolean> {
+    return Promise.resolve(this.readable);
+  }
+
+  exportSession(): string {
+    return "SESSION_STRING_TEST";
+  }
+
+  close(): Promise<void> {
+    this.closeCount += 1;
+    return Promise.resolve();
+  }
+}
+
+function scriptedFactory(): { logins: ScriptedLogin[]; factory: LoginFactory } {
+  const logins: ScriptedLogin[] = [];
+  const factory: LoginFactory = () => {
+    const login = new ScriptedLogin();
+    logins.push(login);
+    return login;
+  };
+  return { logins, factory };
+}
+
+test("setup access: five wrong tokens lock the ip; the global cap is hourly", () => {
+  const access = new SetupAccess(30 * 60_000, false);
+  // 4 wrong → invalid with a shrinking remaining counter
+  for (const remaining of [4, 3, 2, 1]) {
+    const r = access.attemptUnlock("10.0.0.1", "wrong-token");
+    assert.deepEqual(r, { ok: false, code: "invalid", retryAfterSec: 0, remaining });
+  }
+  // the 5th wrong token locks the ip for ~15 min
+  const lock = access.attemptUnlock("10.0.0.1", "wrong-token");
+  assert.deepEqual({ ok: lock.ok, code: (lock as { code: string }).code }, { ok: false, code: "locked" });
+  assert.ok((lock as { retryAfterSec: number }).retryAfterSec >= 880, "lock ≈ 15 min");
+  // even the correct token cannot unlock a locked ip
+  const underLock = access.attemptUnlock("10.0.0.1", access.token);
+  assert.deepEqual({ ok: underLock.ok, code: (underLock as { code: string }).code }, { ok: false, code: "locked" });
+
+  // 6 attempts burned above; 14 more from distinct ips reaches the hourly cap
+  for (let i = 1; i < 15; i++) {
+    const r = access.attemptUnlock(`10.0.0.${i + 1}`, "wrong-token");
+    assert.deepEqual(r, { ok: false, code: "invalid", retryAfterSec: 0, remaining: 4 });
+  }
+  const capped = access.attemptUnlock("10.99.99.99", "wrong-token");
+  assert.deepEqual(
+    { ok: capped.ok, code: (capped as { code: string }).code, hasBackoff: (capped as { retryAfterSec: number }).retryAfterSec > 0 },
+    { ok: false, code: "rate_limited", hasBackoff: true },
+  );
+});
+
+test("setup page: nonce-CSP html under the secret; 404 for wrong secret/standby/env off", async () => {
+  const { factory } = scriptedFactory();
+  const ts = await buildTestServer({ modeBox: { mode: "setup" }, setup: { loginFactory: factory } });
+  try {
+    const page = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup`);
+    assert.equal(page.status, 200);
+    assert.match(page.headers.get("content-type") ?? "", /text\/html; charset=utf-8/);
+    const csp = page.headers.get("content-security-policy") ?? "";
+    assert.match(csp, /script-src 'nonce-[A-Za-z0-9_-]{20,}'/);
+    assert.ok(csp.includes("frame-ancestors 'none'"), "no framing (doc §8 XSS row)");
+    const html = await page.text();
+    assert.ok(html.includes("Welcome") && html.includes("Telegram login"));
+    assert.equal((await fetch(`${ts.baseUrl}/no-such-secret/setup`)).status, 404);
+  } finally {
+    await ts.cleanup();
+  }
+
+  // STANDBY instance: the setup routes vanish (doc 7.2)
+  const ts2 = await buildTestServer({ modeBox: { mode: "standby" }, setup: { loginFactory: factory } });
+  try {
+    assert.equal((await fetch(`${ts2.baseUrl}/${TEST_SECRET}/setup`)).status, 404);
+  } finally {
+    await ts2.cleanup();
+  }
+
+  const ts3 = await buildTestServer({
+    modeBox: { mode: "setup" },
+    setup: { loginFactory: factory },
+    extraEnv: { SETUP_ENABLED: "off" },
+  });
+  try {
+    assert.equal((await fetch(`${ts3.baseUrl}/${TEST_SECRET}/setup`)).status, 404);
+  } finally {
+    await ts3.cleanup();
+  }
+});
+
+test("setup unlock: correct token mints the HttpOnly strict cookie; wrong ones count down", async () => {
+  const { factory } = scriptedFactory();
+  const ts = await buildTestServer({ modeBox: { mode: "setup" }, setup: { loginFactory: factory } });
+  try {
+    const res = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/unlock`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: ts.setupAccess!.token }),
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { ok: boolean; csrf: string; maxAgeSec: number };
+    assert.equal(body.maxAgeSec, 1800, "30-minute session");
+    const sc = res.headers.get("set-cookie") ?? "";
+    assert.ok(sc.startsWith("setup="), sc);
+    for (const part of ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age=1800"]) assert.ok(sc.includes(part), part);
+    // a wrong token from the same ip starts the countdown at 4
+    const wrong = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/unlock`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: "nope" }),
+    });
+    assert.equal(wrong.status, 400);
+    assert.deepEqual(await wrong.json(), { ok: false, code: "invalid", message: "Wrong setup token — use the link from the deploy log", remaining: 4 });
+  } finally {
+    await ts.cleanup();
+  }
+});
+
+test("setup csrf: cookie+header pair required; wrong origin browsers 403", async () => {
+  const { factory } = scriptedFactory();
+  const ts = await buildTestServer({ modeBox: { mode: "setup" }, setup: { loginFactory: factory } });
+  try {
+    const { auth, csrf } = await unlockWizard(ts);
+    const credsBody = { apiId: 12345, apiHash: CRED_API_HASH };
+    // no cookie / no csrf header / wrong csrf → 403 for every setup route
+    const bare = await setupPost(ts, {}, "/api/creds", credsBody);
+    assert.equal(bare.status, 403);
+    assert.deepEqual(await bare.json(), { ok: false, code: "forbidden" });
+    const noCsrf = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/creds`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: auth.cookie },
+      body: JSON.stringify(credsBody),
+    });
+    assert.equal(noCsrf.status, 403);
+    const badCsrf = await setupPost(ts, { cookie: auth.cookie, "x-setup-csrf": "guessing" }, "/api/creds", credsBody);
+    assert.equal(badCsrf.status, 403);
+    // a valid pair gets past the gate → validation made it inside (bad hash → 400 api_id_invalid)
+    const badHash = await setupPost(ts, auth, "/api/creds", { apiId: 12345, apiHash: "zz" });
+    assert.equal(badHash.status, 400);
+    const badHashBody = (await badHash.json()) as { code: string; message: string };
+    assert.equal(badHashBody.code, "api_id_invalid");
+    assert.ok(badHashBody.message.includes("32 hex"));
+    // cross-origin browser requests are refused even with a valid pair
+    const evil = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/creds`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...auth, origin: "http://evil.example" },
+      body: JSON.stringify(credsBody),
+    });
+    assert.equal(evil.status, 403);
+    // same-origin + valid pair persists the credentials
+    const good = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/creds`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...auth, origin: ts.baseUrl },
+      body: JSON.stringify(credsBody),
+    });
+    assert.equal(good.status, 200);
+    assert.equal((await statusOf(ts)).creds, true);
+  } finally {
+    await ts.cleanup();
+  }
+});
+
+test("setup wizard end to end: login, channels, failing then passing verify, finish, closure", async () => {
+  const { logins, factory } = scriptedFactory();
+  const ts = await buildTestServer({ modeBox: { mode: "setup" }, setup: { loginFactory: factory } });
+  try {
+    const { auth, csrf } = await unlockWizard(ts);
+    // login needs credentials first (doc 7.6 row 2)
+    const noCreds = await setupPost(ts, auth, "/api/login/phone", { phone: "+977981234567" });
+    assert.equal(noCreds.status, 409);
+    assert.equal(((await noCreds.json()) as { code: string }).code, "creds_required");
+
+    assert.equal((await setupPost(ts, auth, "/api/creds", { apiId: 12345, apiHash: CRED_API_HASH })).status, 200);
+
+    // phone → the scripted client asks for a code
+    assert.equal((await setupPost(ts, auth, "/api/login/phone", { phone: "+977981234567" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "code");
+    assert.equal((await statusOf(ts)).sentCodeTo, "+977981234567");
+    // wrong code → mapped 400, status shows the mapped error, client discarded
+    const bad = await setupPost(ts, auth, "/api/login/code", { code: "0000" });
+    assert.equal(bad.status, 400);
+    const badBody = (await bad.json()) as { ok: boolean; code: string; message: string; next: string };
+    assert.equal(badBody.ok, false);
+    assert.equal(badBody.code, "phone_code_invalid");
+    assert.equal(badBody.message, "The code is wrong or expired");
+    assert.equal(badBody.next, "Request a new code");
+    await untilStatus(ts, (s) => s.loginError?.code === "phone_code_invalid");
+    assert.equal(logins[0]!.closeCount, 1, "failed login discarded (§8 remnants)");
+
+    // restart works: phone again, right code parks on the password step
+    assert.equal((await setupPost(ts, auth, "/api/login/phone", { phone: "+9779812345675" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "code");
+    assert.equal((await setupPost(ts, auth, "/api/login/code", { code: "12345" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "password");
+    // wrong 2FA password → password_invalid, no lockout
+    const badPw = await setupPost(ts, auth, "/api/login/password", { password: "nope" });
+    assert.equal(badPw.status, 400);
+    const badPwBody = (await badPw.json()) as { ok: boolean; code: string; message: string; next: string };
+    assert.equal(badPwBody.ok, false);
+    assert.equal(badPwBody.code, "password_invalid");
+    assert.equal(badPwBody.message, "Wrong password");
+    assert.equal(badPwBody.next, "Try again — no lockout on our side");
+
+    // restart once more and complete the login
+    assert.equal((await setupPost(ts, auth, "/api/login/phone", { phone: "+977981234565" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "code");
+    assert.equal((await setupPost(ts, auth, "/api/login/code", { code: "12345" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "password");
+    assert.equal((await setupPost(ts, auth, "/api/login/password", { password: "s3cret" })).status, 200);
+    const done = await untilStatus(ts, (s) => s.loginPhase === "done");
+    assert.deepEqual(done.user, { id: 7, name: "Test User" });
+
+    // channels + audio counts straight from the dialogs
+    const chans = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/channels`, {
+      headers: { cookie: auth.cookie, "x-setup-csrf": csrf },
+    });
+    assert.equal(chans.status, 200);
+    assert.deepEqual(await chans.json(), [{ id: -100123, title: "Music" }]);
+    const count = await setupPost(ts, auth, "/api/channels/count", { id: -100123 });
+    assert.equal(count.status, 200);
+    assert.deepEqual(await count.json(), { id: -100123, count: 12, total: 99 });
+    const badId = await setupPost(ts, auth, "/api/channels/count", { id: 5 });
+    assert.equal(badId.status, 400);
+    assert.equal(((await badId.json()) as { code: string }).code, "bad_channel");
+
+    // options (null=false) persist
+    assert.equal(
+      (await setupPost(ts, auth, "/api/options", { allowDownloads: false, monthlyBytesBudget: 4500000000, channels: [-100123] })).status,
+      200,
+    );
+    const badOpt = await setupPost(ts, auth, "/api/options", { monthlyBytesBudget: -1 });
+    assert.equal(badOpt.status, 400);
+    assert.equal(((await badOpt.json()) as { code: string }).code, "bad_options");
+    assert.deepEqual((await statusOf(ts)).options, { allowDownloads: false, monthlyBytesBudget: 4500000000 });
+
+    // verify #1 — the wizard refuses finish while rows fail
+    ts.setupSelfFetch.current = () => Promise.resolve(null); // manifest unreachable
+    logins[logins.length - 1]!.readable = false; // channel joined with the account?
+    ts.setupProbe.held = false; // another instance owns the session lease
+    ts.setupProbe.detail = "another instance holds the lease";
+    const neg = await setupPost(ts, auth, "/api/verify", {});
+    assert.equal(neg.status, 200);
+    const negRep = (await neg.json()) as StatusPayload["verify"];
+    assert.equal(negRep!.finishAllowed, false);
+    const row = (id: string) => negRep!.rows.find((r) => r.id === id)!;
+    assert.equal(row("telegram").ok, true);
+    assert.equal(row("channels").ok, false, `channel unreadable: ${JSON.stringify(negRep!.rows)}`);
+    assert.equal(row("public_url").severity, "fail");
+    assert.equal(row("lease").severity, "fail");
+    assert.equal(row("audio").detail.includes("12 audio"), true);
+    assert.equal(negRep!.rows.some((r) => r.id === "redis"), false, "no Redis configured → no redis row");
+    const finBad = await setupPost(ts, auth, "/api/finish", {});
+    assert.equal(finBad.status, 409);
+    const finBadBody = (await finBad.json()) as { ok: boolean; code: string; message: string; next: string };
+    assert.equal(finBadBody.code, "verify_required");
+    assert.equal(finBadBody.message, "Run the checks again");
+    assert.equal(finBadBody.next, "Press verify — every red row has to clear");
+    assert.equal(ts.savedRecord.current, null);
+    assert.equal(ts.modeBox.mode, "setup");
+
+    // verify #2 — all checks clear
+    ts.setupSelfFetch.current = (url) =>
+      Promise.resolve(url.endsWith(`${TEST_SECRET}/manifest.json`) ? JSON.stringify({ id: ts.cfg.addonId }) : null);
+    logins[logins.length - 1]!.readable = true;
+    ts.setupProbe.held = true;
+    ts.setupProbe.detail = "lease held by this instance";
+    const ok = await setupPost(ts, auth, "/api/verify", {});
+    const okRep = (await ok.json()) as StatusPayload["verify"];
+    assert.equal(okRep!.finishAllowed, true);
+    const okRow = (id: string) => okRep!.rows.find((r) => r.id === id)!;
+    assert.equal(okRow("telegram").detail, "Test User");
+    assert.equal(okRow("channels").detail, "channel -100123 readable");
+    assert.equal(okRow("lease").detail, "lease held by this instance");
+    assert.equal(okRow("public_url").detail, ts.cfg.publicBaseUrl);
+
+    // finish: persist → swap → close
+    const fin = await setupPost(ts, auth, "/api/finish", {});
+    assert.equal(fin.status, 200);
+    assert.deepEqual(await fin.json(), { ok: true, publicUrl: `${ts.baseUrl}/${TEST_SECRET}` });
+    assert.equal(ts.modeBox.mode, "active", "bringUp landed the service in ACTIVE");
+    const rec = ts.savedRecord.current!;
+    assert.deepEqual(rec.sessions, ["SESSION_STRING_TEST"]);
+    assert.deepEqual(rec.channels, [-100123]);
+    assert.equal(rec.apiId, 12345);
+    assert.equal(rec.apiHash, CRED_API_HASH);
+    assert.deepEqual(rec.options, { allowDownloads: false, monthlyBytesBudget: 4500000000 });
+    // the encrypted store round-trips through the same record (FR-28)
+    const blob = readFileSync(path.join(ts.dir, "config.enc"), "utf8");
+    const plain = decryptConfig(blob, ts.cfg.configKey);
+    assert.ok(plain, "config blob decrypts");
+    const round = parseStoredConfig(plain);
+    assert.ok(round, "parsed v1 record");
+    assert.deepEqual(round.sessions, rec.sessions);
+    assert.deepEqual(round.channels, rec.channels);
+    assert.deepEqual(round.options, rec.options);
+
+    // closure: the site 404s, status keeps answering, remnants cleared
+    assert.equal((await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup`)).status, 404);
+    const afterCreds = await setupPost(ts, auth, "/api/creds", { apiId: 1, apiHash: CRED_API_HASH });
+    assert.equal(afterCreds.status, 404);
+    const sAfter = await statusOf(ts);
+    assert.equal(sAfter.closed, true);
+    assert.equal(sAfter.publicUrl, `${ts.baseUrl}/${TEST_SECRET}`);
+    assert.equal(sAfter.user, null);
+    assert.ok(logins.every((l) => l.closeCount >= 1), "every discarded login was closed");
+  } finally {
+    await ts.cleanup();
+  }
+});
+
+test("setup finish: a failed bring-up answers startup_pending 503; a retry can pass", async () => {
+  const { factory } = scriptedFactory();
+  let bringUpCalls = 0;
+  const ts = await buildTestServer({
+    modeBox: { mode: "setup" },
+    setup: {
+      loginFactory: factory,
+      async bringUp() {
+        bringUpCalls += 1;
+        // doc 7.9.3: the swap may not land yet — surface it, keep the wizard open
+        return bringUpCalls === 1 ? { ok: false, message: "flaky swap" } : { ok: true };
+      },
+    },
+  });
+  try {
+    const { auth } = await unlockWizard(ts);
+    assert.equal((await setupPost(ts, auth, "/api/creds", { apiId: 12345, apiHash: CRED_API_HASH })).status, 200);
+    assert.equal((await setupPost(ts, auth, "/api/login/phone", { phone: "+977981234567" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "code");
+    assert.equal((await setupPost(ts, auth, "/api/login/code", { code: "12345" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "password");
+    assert.equal((await setupPost(ts, auth, "/api/login/password", { password: "s3cret" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "done");
+    assert.equal(
+      (await setupPost(ts, auth, "/api/options", { allowDownloads: true, monthlyBytesBudget: 4500000000, channels: [-100123] })).status,
+      200,
+    );
+    ts.setupSelfFetch.current = (url) =>
+      Promise.resolve(url.endsWith(`${TEST_SECRET}/manifest.json`) ? JSON.stringify({ id: ts.cfg.addonId }) : null);
+    const rep = (await (await setupPost(ts, auth, "/api/verify", {})).json()) as StatusPayload["verify"];
+    assert.equal(rep!.finishAllowed, true);
+
+    const first = await setupPost(ts, auth, "/api/finish", {});
+    assert.equal(first.status, 503);
+    const firstBody = (await first.json()) as { code: string; message: string };
+    assert.equal(firstBody.code, "startup_pending");
+    assert.equal(firstBody.message, "flaky swap");
+    assert.equal((await statusOf(ts)).closed, false, "the wizard stays open for a retry");
+
+    const retry = await setupPost(ts, auth, "/api/finish", {});
+    assert.equal(retry.status, 200);
+    assert.equal(bringUpCalls, 2);
+    assert.equal((await statusOf(ts)).closed, true);
+  } finally {
+    await ts.cleanup();
+  }
+});
+
+test("setup idle: inactivity discards the login and surfaces login_idle (doc 7.6)", async () => {
+  const { logins, factory } = scriptedFactory();
+  const ts = await buildTestServer({ modeBox: { mode: "setup" }, setup: { loginFactory: factory, idleMs: 300 } });
+  try {
+    const { auth, csrf } = await unlockWizard(ts);
+    assert.equal((await setupPost(ts, auth, "/api/creds", { apiId: 12345, apiHash: CRED_API_HASH })).status, 200);
+    assert.equal((await setupPost(ts, auth, "/api/login/phone", { phone: "+977981234567" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "code");
+    assert.equal((await setupPost(ts, auth, "/api/login/code", { code: "12345" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "password");
+    assert.equal((await setupPost(ts, auth, "/api/login/password", { password: "s3cret" })).status, 200);
+    await untilStatus(ts, (s) => s.loginPhase === "done");
+    await sleep(500);
+
+    const s = await statusOf(ts);
+    assert.equal(s.loginPhase, null);
+    assert.equal(s.loginError?.code, "login_idle");
+    assert.equal(s.user, null, "login state is not kept alive");
+    // the discarded login cannot be reused for channels
+    const chans = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/channels`, {
+      headers: { cookie: auth.cookie, "x-setup-csrf": csrf },
+    });
+    assert.equal(chans.status, 409);
+    assert.equal(((await chans.json()) as { code: string }).code, "login_required");
+    assert.ok(logins.every((l) => l.closeCount >= 1), "idle discard closed the seam");
   } finally {
     await ts.cleanup();
   }

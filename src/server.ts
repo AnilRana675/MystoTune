@@ -8,10 +8,11 @@
  * M2), manifest/search/healthz work with Telegram down or unconfigured (FR-18).
  */
 import Fastify, { LogController, type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 
 import { RATE_LIMITS, applyStoredConfig, loadConfig, type AppConfig } from "./config";
+import type { StoredConfigV1 } from "./configStore";
 import { ConfigStore, DEFAULT_CONFIG_FILE } from "./configStore";
 import { deriveInstanceId, SessionLease } from "./lease";
 import {
@@ -39,6 +40,8 @@ import { audioDescriptor, audioQuality, cleanName, formatOf, parseTrackId, quali
 import { probeFirstBytes } from "./probe";
 import { IndexIndexer, restoreSnapshotIfEmpty } from "./index-loop";
 import { openRedisStore, type RedisStore } from "./redis";
+import { renderSetupPage, SetupAccess, SetupError, SetupManager, type LoginFactory, type SetupChannel, type SetupDeps, type SetupLogin } from "./setup";
+import bigInt from "big-integer"; // gramJS BigInteger for the setup login adapter
 
 const RANGE_PROBE_LIMIT = 4096; // HEAD and <=4 KiB range probes are free (FR-19)
 
@@ -134,6 +137,18 @@ export interface BuildOptions {
   logLevel?: AppConfig["logLevel"];
   /** M6.1 state machine cell (defaults to active for boots/tests without a lease). */
   modeBox?: AddonModeBox;
+  /** M6.2: mutable runtime the SETUP finish flow swaps into. Keep passing the
+   * same object so route handlers see swapped telegram/indexer/config. */
+  runtime?: BuildRuntime;
+  /** M6.2 wizard deps (main()/tests wire persistence + leased bring-up). */
+  setup?: SetupDeps | null;
+}
+
+/** Mutable runtime cell behind the routes (M6.2 finish swap). */
+export interface BuildRuntime {
+  cfg: AppConfig;
+  telegram: TelegramManager;
+  indexer: IndexIndexer | null;
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -145,8 +160,9 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 export function buildServer(opts: BuildOptions): FastifyInstance {
   const { config: cfg, db } = opts;
-  const telegram = opts.telegram;
-  const indexer = opts.indexer ?? null;
+  // M6.2: routes read through the runtime cell so the wizard's finish flow can
+  // swap in a fresh TelegramManager/IndexIndexer once the config is persisted.
+  const runtime: BuildRuntime = opts.runtime ?? { cfg, telegram: opts.telegram, indexer: opts.indexer ?? null };
   const metrics = opts.metrics ?? createMetrics();
   const redisStore = opts.redis ?? null;
   // §4.11: with a Redis store, its take() (INCR/EXPIRE + local fallback) IS the
@@ -237,6 +253,12 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     }
     if ((err as { code?: string })?.code === "FST_ERR_REQ_ABORTED") {
       return reply.code(408).send({});
+    }
+    if (err instanceof SetupError) { // M6.2 wizard errors (doc 7.6 body shape)
+      if (err.retryAfterSec) reply.header("retry-after", String(err.retryAfterSec));
+      return reply
+        .code(err.httpStatus)
+        .send({ ok: false, code: err.code, message: err.message, next: err.next, remaining: 0 });
     }
     app.log.error({ err: (err as Error)?.message }, "handler error");
     return reply.code(500).send({});
@@ -346,13 +368,13 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     } else {
       // §4.15 cold start: Fastify serves first; give the Telegram session up
       // to 10 s to come online before surfacing a 503/Retry-After.
-      if (telegram.state === "connecting" && !(await telegram.waitForReady(10_000))) {
+      if (runtime.telegram.state === "connecting" && !(await runtime.telegram.waitForReady(10_000))) {
         return reply.code(503).header("retry-after", "5").send({});
       }
-      await telegram.resolveDocument(row);
+      await runtime.telegram.resolveDocument(row);
       // FR-13 (M4): fire-and-forget deep probe — fills album/duration, detects
       // ALAC; never blocks or fails the stream response (§4.13).
-      void enrichRow(db, telegram, row);
+      void enrichRow(db, runtime.telegram, row);
     }
 
     const token = createMediaToken(row.id, cfg.mediaSigningKey, cfg.mediaUrlTtlSeconds);
@@ -398,15 +420,15 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     } else {
       // §4.15 cold start: media tokens may outlive a fresh deploy; only wait
       // while a connect attempt is genuinely still in flight.
-      if (telegram.state === "connecting" && !(await telegram.waitForReady(10_000))) {
+      if (runtime.telegram.state === "connecting" && !(await runtime.telegram.waitForReady(10_000))) {
         return reply.code(503).header("retry-after", "5").send({});
       }
-      const live = await telegram.resolveDocument(row); // 404/503/429 per §4.4 (pre-hijack)
+      const live = await runtime.telegram.resolveDocument(row); // 404/503/429 per §4.4 (pre-hijack)
       if (live && (live.size !== size || live.docId !== row.docId)) {
         size = live.size;
         etag = etagFor(live.docId, size);
       }
-      if (!isHead) source = telegram.docSource(row); // M2 byte bridge (§4.7)
+      if (!isHead) source = runtime.telegram.docSource(row); // M2 byte bridge (§4.7)
     }
 
     const range = parseRange(req.headers.range, size);
@@ -588,7 +610,7 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
 
     let src: ArtSource | null = null;
     try {
-      src = await telegram.artSource(row);
+      src = await runtime.telegram.artSource(row);
     } catch (err) {
       if (err instanceof TelegramSourceError) {
         if (err.kind === "flood") {
@@ -683,7 +705,7 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
   app.get("/healthz", (_req, reply) => {
     const mem = process.memoryUsage();
     return jsonify(reply, {
-      ok: telegram.state !== "fatal",
+      ok: runtime.telegram.state !== "fatal",
       mode: modeBox.mode, // M6.1 (doc 7.2): setup | standby | active | draining | failed
       uptimeSec: Math.round((Date.now() - metrics.since) / 1000),
       rss: kb(mem.rss),
@@ -696,14 +718,14 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
       budgetBytes: budget.usedLocal, // §4.15 (process-local; bytes:month is the shared truth)
       monthlyBytesBudget: cfg.monthlyBytesBudget,
       indexCount: countTracks(db),
-      indexing: Boolean(indexer?.active),
-      lastSyncAt: indexer?.lastSyncAt ?? 0,
-      telegram: telegram.state,
-      telegramDetail: telegram.detail,
+      indexing: Boolean(runtime.indexer?.active),
+      lastSyncAt: runtime.indexer?.lastSyncAt ?? 0,
+      telegram: runtime.telegram.state,
+      telegramDetail: runtime.telegram.detail,
       cache: {
         redis: redisStore ? redisStore.status() : "off",
         redisStats: redisStore ? redisStore.stats() : null,
-        docEntries: telegram.resolvedDocs.size,
+        docEntries: runtime.telegram.resolvedDocs.size,
         queryEntries: redisStore ? redisStore.queryEntryCount() : 0,
       },
       counters: {
@@ -718,10 +740,158 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     });
   });
 
+  /* ----------------------------------------------------- M6.2 setup wizard */
+
+  // Doc 7.5: the wizard only exists while the addon is in SETUP mode; after
+  // finishing (or SETUP_ENABLED=off) every /setup/* route answers 404.
+  const setupAccess = opts.setup ? new SetupAccess(30 * 60_000, cfg.publicBaseUrl.startsWith("https://")) : null;
+  const setupMgr = opts.setup ? new SetupManager(opts.setup) : null;
+  const setupOpen = (): boolean =>
+    Boolean(setupMgr && setupAccess && !setupMgr.closed && modeBox.mode === "setup" && cfg.setupEnabled !== "off");
+
+  /** CSRF + Origin guard for everything under /setup/api (§8). */
+  const setupOpenCheck = (req: FastifyRequest, reply: FastifyReply): FastifyReply | null => {
+    if (!secretOk((req.params as { secret?: string }).secret) || !setupOpen()) return reply.code(404).send({});
+    const origin = req.headers.origin;
+    if (typeof origin === "string" && origin !== "") {
+      try {
+        if (new URL(origin).host !== new URL(cfg.publicBaseUrl).host) {
+          return jsonify(reply, { ok: false, code: "forbidden" }, 403);
+        }
+      } catch {
+        return jsonify(reply, { ok: false, code: "forbidden" }, 403);
+      }
+    }
+    return null;
+  };
+
+  /** Session-bearing guard: everything that needs an unlocked wizard. */
+  const setupGate = (req: FastifyRequest, reply: FastifyReply): FastifyReply | null => {
+    const deny = setupOpenCheck(req, reply);
+    if (deny) return deny;
+    if (!setupAccess!.authorized(req)) return jsonify(reply, { ok: false, code: "forbidden" }, 403);
+    return null;
+  };
+
+  const secretOnly = (req: FastifyRequest, reply: FastifyReply): FastifyReply | null =>
+    secretOk((req.params as { secret?: string }).secret) ? null : reply.code(404).send({});
+
+  app.get("/:secret/setup", (req, reply) => {
+    // the page is served BEFORE any session exists — unlock happens client-side
+    const deny = setupOpenCheck(req, reply);
+    if (deny) return deny;
+    const nonce = randomBytes(16).toString("base64url");
+    return reply
+      .code(200)
+      .type("text/html; charset=utf-8")
+      .header(
+        "content-security-policy",
+        `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'`,
+      )
+      .send(renderSetupPage(nonce));
+  });
+
+  // Doc 7.5: the 144-bit boot token (from URL fragment) → 30-min cookie.
+  app.post("/:secret/setup/api/unlock", (req, reply) => {
+    const deny = setupOpenCheck(req, reply); // unlock must work with no session yet
+    if (deny) return deny;
+    const res = setupAccess!.attemptUnlock(req.ip, (req.body as { token?: unknown } | undefined)?.token);
+    if (res.ok) {
+      reply.header("set-cookie", setupAccess!.cookieHeader(res));
+      return jsonify(reply, { ok: true, csrf: res.csrf, maxAgeSec: res.maxAgeSec });
+    }
+    if (res.retryAfterSec > 0) reply.header("retry-after", String(res.retryAfterSec));
+    const message =
+      res.code === "invalid"
+        ? "Wrong setup token — use the link from the deploy log"
+        : res.code === "locked"
+          ? "Too many wrong attempts — try again later"
+          : "Too many unlock attempts — try again later";
+    return jsonify(
+      reply,
+      { ok: false, code: res.code, message, remaining: "remaining" in res ? res.remaining : 0 },
+      res.code === "invalid" ? 400 : 429,
+    );
+  });
+
+  app.post("/:secret/setup/api/creds", (req, reply) => {
+    const deny = setupGate(req, reply);
+    if (deny) return deny;
+    const body = (req.body ?? {}) as { apiId?: unknown; apiHash?: unknown };
+    setupMgr!.saveCreds(body);
+    return jsonify(reply, { ok: true });
+  });
+
+  app.post("/:secret/setup/api/login/phone", async (req, reply) => {
+    const deny = setupGate(req, reply);
+    if (deny) return deny;
+    await setupMgr!.requestLoginCode((req.body as { phone?: unknown } | undefined)?.phone);
+    return jsonify(reply, { ok: true });
+  });
+
+  app.post("/:secret/setup/api/login/code", async (req, reply) => {
+    const deny = setupGate(req, reply);
+    if (deny) return deny;
+    await setupMgr!.submitCode((req.body as { code?: unknown } | undefined)?.code);
+    return jsonify(reply, { ok: true });
+  });
+
+  app.post("/:secret/setup/api/login/password", async (req, reply) => {
+    const deny = setupGate(req, reply);
+    if (deny) return deny;
+    await setupMgr!.submitPassword((req.body as { password?: unknown } | undefined)?.password);
+    return jsonify(reply, { ok: true });
+  });
+
+  app.get("/:secret/setup/api/channels", async (req, reply) => {
+    const deny = setupGate(req, reply);
+    if (deny) return deny;
+    return jsonify(reply, await setupMgr!.listChannels());
+  });
+
+  app.post("/:secret/setup/api/channels/count", async (req, reply) => {
+    const deny = setupGate(req, reply);
+    if (deny) return deny;
+    return jsonify(reply, await setupMgr!.audioCount((req.body as { id?: unknown } | undefined)?.id));
+  });
+
+  app.post("/:secret/setup/api/options", (req, reply) => {
+    const deny = setupGate(req, reply);
+    if (deny) return deny;
+    setupMgr!.saveOptions((req.body ?? {}) as Parameters<SetupManager["saveOptions"]>[0]);
+    return jsonify(reply, { ok: true });
+  });
+
+  app.post("/:secret/setup/api/verify", async (req, reply) => {
+    const deny = setupGate(req, reply);
+    if (deny) return deny;
+    return jsonify(reply, await setupMgr!.verify());
+  });
+
+  app.post("/:secret/setup/api/finish", async (req, reply) => {
+    const deny = setupGate(req, reply);
+    if (deny) return deny;
+    const out = await setupMgr!.finish();
+    return jsonify(reply, { ok: true, ...out });
+  });
+
+  // Minimal status page (FR-33 starter; full json lands in M6.4). Stays up
+  // after the wizard closes so the owner can confirm the addon went live.
+  app.get("/:secret/status", (req, reply) => {
+    const deny = secretOnly(req, reply);
+    if (deny) return deny;
+    return jsonify(reply, setupMgr ? setupMgr.getStatus() : { closed: true, reason: "not built" });
+  });
+
   /* expose internals for tests/soak */
-  const augmented = app as unknown as FastifyInstance & { metrics: Metrics; admissions: Admissions };
+  const augmented = app as unknown as FastifyInstance & {
+    metrics: Metrics;
+    admissions: Admissions;
+    setup?: { access: SetupAccess; manager: SetupManager };
+  };
   augmented.metrics = metrics;
   augmented.admissions = admissions;
+  if (setupAccess && setupMgr) augmented.setup = { access: setupAccess, manager: setupMgr };
   return app;
 }
 
@@ -878,6 +1048,95 @@ export async function bootTelegram(
   return telegram.state === "fatal" ? "fatal" : telegram.state === "ready" ? "ready" : "neutral";
 }
 
+/**
+ * M6.2 (doc 7.6): the real Telegram login adapter behind the SetupLogin seam.
+ * One client with an empty StringSession; client.start()'s callbacks are the
+ * SetupManager's resolver valves. Session export only after a completed
+ * login. Kept small deliberately — the live check happens on Render (M6.3).
+ */
+async function makeGramJSLoginFactory(): Promise<LoginFactory> {
+  const mod = await import("telegram");
+  const ApiNs = mod.Api;
+  const StringSession = mod.sessions.StringSession;
+  const { Logger, LogLevel } = (await import("telegram/extensions/Logger.js")) as unknown as {
+    Logger: { new (level?: string): never };
+    LogLevel: { ERROR: string };
+  };
+  const log = new Logger(LogLevel.ERROR);
+  const userOf = (u: unknown): { id: number; name: string } => {
+    const user = u as { id?: { toString(): string }; firstName?: string; lastName?: string; username?: string };
+    const name = [user.firstName, user.lastName].filter(Boolean).join(" ") || String(user.username ?? "telegram user");
+    return { id: Number(user.id?.toString() ?? 0), name };
+  };
+  return (creds: { apiId: number; apiHash: string }): SetupLogin => {
+    const client = new mod.TelegramClient(
+      new StringSession(""),
+      creds.apiId,
+      creds.apiHash,
+      { connectionRetries: 3, retryDelay: 2000, autoReconnect: false, floodSleepThreshold: 0, baseLogger: log },
+    );
+    client.setLogLevel("error" as unknown as Parameters<typeof client.setLogLevel>[0]);
+    const peers = new Map<number, { channelId: string; accessHash: string }>();
+    const peerOf = (id: number): { channelId: string; accessHash: string } | null => peers.get(id) ?? null;
+    return {
+      start: (cb) =>
+        client
+          .start({
+            phoneNumber: cb.phone,
+            phoneCode: cb.code,
+            password: cb.password,
+            onError: () => undefined, // gramJS requires the hook; errors surface via the pending callback promises
+          })
+          .then(userOf),
+      whoAmI: async () => userOf(await client.getMe()),
+      dialogs: async () => {
+        const list = await client.getDialogs({ limit: 200 });
+        const out: SetupChannel[] = [];
+        for (const d of list) {
+          const e = d.entity as { className?: string; id?: { toString(): string }; title?: string; broadcast?: boolean; megagroup?: boolean; accessHash?: { toString(): string } };
+          if (e.className === "Channel" && (e.broadcast || e.megagroup)) {
+            const key = Number(`-100${e.id?.toString() ?? 0}`);
+            out.push({ id: key, title: String(e.title ?? "channel") });
+            peers.set(key, { channelId: String(e.id?.toString() ?? ""), accessHash: String(e.accessHash?.toString() ?? "") });
+          }
+        }
+        return out;
+      },
+      audioCount: async (id: number) => {
+        const peer = peerOf(id);
+        if (!peer) return { count: 0, total: 0 };
+        const found = (await client.invoke(
+          new ApiNs.messages.Search({
+            peer: new ApiNs.InputPeerChannel({ channelId: bigInt(peer.channelId), accessHash: bigInt(peer.accessHash) }),
+            filter: new ApiNs.InputMessagesFilterMusic(),
+            limit: 1,
+            hash: bigInt(0),
+          }),
+        )) as unknown as { count?: unknown; className?: string };
+        const total = Number(found.count ?? 0);
+        return { count: found.className === "messages_Found" || total > 0 ? total : 0, total };
+      },
+      channelReadable: async (id: number) => {
+        const peer = peerOf(id);
+        if (!peer) return false;
+        const msgs = await client.getMessages(
+          new ApiNs.InputPeerChannel({ channelId: bigInt(peer.channelId), accessHash: bigInt(peer.accessHash) }),
+          { limit: 1 },
+        );
+        return Array.isArray(msgs) && msgs.length > 0;
+      },
+      exportSession: () => (client.session as unknown as { save(): string }).save(),
+      close: async () => {
+        try {
+          await client.disconnect();
+        } catch {
+          void 0;
+        }
+      },
+    };
+  };
+}
+
 export async function main(): Promise<void> {
   let cfg = loadConfig();
   const db = openDb(cfg.dbPath);
@@ -900,9 +1159,93 @@ export async function main(): Promise<void> {
   const modeBox: AddonModeBox = { mode: cfg.telegram.configured ? "standby" : "setup" };
   let lease: SessionLease | null = null; // set below when Redis + session exist
   let clearAcquire: () => void = () => {}; // stops the STANDBY poll on drain
-  const app = buildServer({ config: cfg, db, telegram, indexer, redis, modeBox });
+  // M6.2: routes read through this cell; the wizard's finish swaps Telegram
+  // and the indexer after the config store saves a verified record.
+  const runtime: BuildRuntime = { cfg, telegram, indexer };
+
+  // Re-read the mode cell through a call so TS narrowing can't assume it is
+  // stable across awaits (the lease loop, bringUp and drain mutate it).
+  const modeIs = (m: AddonMode): boolean => modeBox.mode === m;
+
+  /** SETUP finish (doc 7.9): swap runtime, SETUP -> STANDBY -> ACTIVE. */
+  const bringUp = async (record: StoredConfigV1): Promise<{ ok: boolean; message?: string }> => {
+    const cfg2 = applyStoredConfig(runtime.cfg, record);
+    await telegram.stop().catch(() => undefined); // the SETUP-mode placeholder manager
+    const t2 = new TelegramManager(cfg2, redis);
+    runtime.telegram = t2;
+    runtime.cfg = cfg2;
+    runtime.indexer = new IndexIndexer(db, t2, cfg2, undefined, redis);
+    modeBox.mode = "standby"; // doc 7.9.2
+    try {
+      await restoreSnapshotIfEmpty(db, cfg2, redis); // doc 7.9.3 snapshot first
+    } catch {
+      void 0; // a down Redis must never block finishing
+    }
+    if (redis) {
+      lease = new SessionLease({
+        redis,
+        lease: cfg2.lease,
+        instanceId: deriveInstanceId(process.env),
+        slot: 0,
+        onFenced: () => {
+          modeBox.mode = "standby";
+          runtime.indexer?.stop();
+          void t2.stop();
+        },
+      });
+      const leaseCb = lease;
+      const deadline = Date.now() + 60_000;
+      let held = false;
+      while (Date.now() < deadline) {
+        if (await leaseCb.tryAcquire()) {
+          held = true;
+          break;
+        }
+        await delayMs(cfg2.lease.pollMs);
+        if (!modeIs("standby")) return { ok: false, message: "the service drained while waiting for the lease" };
+      }
+      if (!held) return { ok: false, message: "another instance holds the session lease" };
+    }
+    await goActive();
+    return { ok: modeIs("active") };
+  };
+
+  /** SETUP wizard deps: verified write inline, ACTIVE transitions via main. */
+  const setupDeps: SetupDeps | undefined = modeBox.mode === "setup"
+    ? {
+        cfg,
+        configStore,
+        redis,
+        loginFactory: await makeGramJSLoginFactory(),
+        bringUp,
+        leaseProbe: async () => {
+          if (!redis) return { held: true, detail: "no Redis — M5 single-instance fallback" };
+          const leaseCb = lease; // TS18047: snapshot into a local
+          if (leaseCb?.isHeld) return { held: true, detail: "lease held by this instance" };
+          if (leaseCb) {
+            const got = await leaseCb.tryAcquire().catch(() => false);
+            return {
+              held: got || leaseCb.isHeld,
+              detail: leaseCb.isHeld ? "lease held by this instance" : got ? "lease acquired by this instance" : "another instance may hold the lease — verify again after it drains",
+            };
+          }
+          return { held: true, detail: "no lease yet — an unconfigured boot holds nothing" };
+        },
+      }
+    : undefined;
+
+  const app = buildServer({ config: cfg, db, telegram, indexer, redis, modeBox, runtime, setup: setupDeps });
   await app.listen({ port: cfg.port, host: "0.0.0.0" });
   app.log.info(`BitChord addon serving on :${cfg.port} (v${cfg.addonVersion})`);
+
+  // M6.2 (doc §5 row 3): the setup link lives in the LOGS ONLY — token in the
+  // URL fragment so browsers never transmit it (no access-log leakage).
+  if (setupDeps) {
+    const acc = (app as unknown as { setup?: { access?: SetupAccess } }).setup?.access;
+    if (acc) {
+      app.log.warn(`[setup] open ${cfg.publicBaseUrl}/${cfg.addonSecret}/setup#t=${acc.token}`);
+    }
+  }
 
   // §4.15: Fastify is already serving. Restore a Redis snapshot into an empty
   // disk index BEFORE the Telegram client connects, so the boot sync reads
@@ -917,23 +1260,27 @@ export async function main(): Promise<void> {
   let draining = false;
   // Re-read the mode cell through a call so TS narrowing can't assume it is
   // stable across awaits (the lease loop and the drain handler mutate it).
-  const modeIs = (m: AddonMode): boolean => modeBox.mode === m;
-
-  /** STANDBY → ACTIVE: connect Telegram (overlap-retry), then start indexing. */
+  /** STANDBY → ACTIVE: connect Telegram (overlap-retry), then start indexing.   * Reads runtime.* — the M6.2 finish flow replaces the manager before the
+   * first goActive() under SETUP boot. */
   const goActive = async (): Promise<void> => {
     if (modeIs("draining")) return;
-    const bootState = await bootTelegram(telegram, cfg, app.log);
+    const bootState = await bootTelegram(runtime.telegram, runtime.cfg, app.log);
     if (modeIs("draining")) return; // SIGTERM raced the connect
-    if (bootState === "fatal" || telegram.state === "fatal") {
+    if (bootState === "fatal" || runtime.telegram.state === "fatal") {
       modeBox.mode = "failed";
-      app.log.error(`${telegram.detail} — run npm run session to re-provision; exiting`);
+      app.log.error(`${runtime.telegram.detail} — run npm run session to re-provision; exiting`);
       await app.close();
       redis?.close();
       process.exit(1);
     }
-    indexer.start();
+    runtime.indexer?.start();
     modeBox.mode = "active";
     app.log.info("lease held — addon is active");
+  };
+
+  const drainingSetup = async (): Promise<void> => {
+    const s = (app as unknown as { setup?: { manager?: { close(): Promise<void> } } }).setup?.manager;
+    if (s) await s.close().catch(() => undefined); // §8: wizard state discarded on drain
   };
 
   if (modeBox.mode === "setup") {
@@ -950,8 +1297,8 @@ export async function main(): Promise<void> {
       onFenced: () => {
         app.log.warn("redis lease lost (renewal misses) — self-fencing: telegram I/O stopped, STANDBY");
         modeBox.mode = "standby";
-        indexer.stop();
-        void telegram.stop();
+        runtime.indexer?.stop();
+        void runtime.telegram.stop();
       },
     });
     let acquireTimer: NodeJS.Timeout | null = null;
@@ -981,14 +1328,15 @@ export async function main(): Promise<void> {
     draining = true;
     modeBox.mode = "draining";
     clearAcquire();
-    indexer.stop();
+    runtime.indexer?.stop();
     const deadline = Date.now() + cfg.lease.drainMs;
     const activeStreams = () => {
       const a = (app as unknown as { admissions?: { activeCount: number } }).admissions;
       return a?.activeCount ?? 0;
     };
     while (activeStreams() > 0 && Date.now() < deadline) await delayMs(100);
-    await telegram.stop();
+    await drainingSetup();
+    await runtime.telegram.stop();
     if (lease) await lease.release(); // compare-and-delete only our own slot
     await app.close();
     redis?.close();

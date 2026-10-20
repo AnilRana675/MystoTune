@@ -67,7 +67,7 @@ headers are committed, so cold/FloodWait/expired-reference failures surface as r
 ## Tests & soak
 
 ```bash
-npm test                        # 124 assertions across contract/range/query/admission/fault/m1/m2/m3/m4/m6
+npm test                        # 131 assertions across contract/range/query/admission/fault/m1/m2/m3/m4/m6
 npm run soak -- --seconds 60 --no-budget --out docs/m5-soak-baseline.json
 ```
 
@@ -197,3 +197,17 @@ stays the default image for its glibc `MALLOC_ARENA_MAX` support).
   AUTH_KEY_DUPLICATED retry fallback. Tests: 124/124 incl. fake-Redis
   two-instance lease races, Appendix A Lua ownership checks, self-fence, and
   every mode gate.
+- **M6.2 ✅ guided setup website (doc 7.5-7.9)** — wizard under
+  `/{secret}/setup`, unlocked by a 144-bit token from the deploy log
+  (`[setup] open …#t=`) that mints an HttpOnly `SameSite=Strict` session
+  cookie (30 min) + paired `x-setup-csrf` header; every screen sits behind
+  secret + open-mode + origin-host gates. Flow: unlock → creds (api id/hash
+  32 hex) → Telegram login by callback valves (phone → code → optional
+  password; 5-min idle discard surfaces `login_idle`, errors mapped per doc
+  7.6 incl. flood_wait) → channels (dialogs `id ≤ -100`, per-channel audio
+  counts via the music filter) → options → verify (redis/telegram/channels/
+  audio/public-url/lease rows; `finishAllowed` only with zero fail rows) →
+  finish atomically saves the encrypted store entry, swaps runtime
+  (SETUP→STANDBY→ACTIVE; failed swap = `startup_pending` 503 + retry) and
+  404s every `/setup` route afterwards. New modules: `src/setup.ts`
+  (SetupAccess/SetupManager) + scripted-login test seams; 131/131 tests.

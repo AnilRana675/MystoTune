@@ -16,6 +16,8 @@ import type { Admissions } from "../src/media.js";
 import type { Metrics } from "../src/server.js";
 import { openRedisStore, type RedisStore } from "../src/redis.js";
 import { seedFixtureDb, CHAT_ID } from "../scripts/seed-fixture.js";
+import { ConfigStore, type StoredConfigV1 } from "../src/configStore.js";
+import { SetupAccess, SetupManager, type LoginFactory, type SetupDeps } from "../src/setup.js";
 
 export { CHAT_ID };
 
@@ -36,7 +38,17 @@ export interface TestServer {
   tracks: TrackRow[];
   /** present when the tests inject a Redis-backed limiter/cache (§4.11) */
   redis: RedisStore | null;
-  cleanup(): Promise<void>;
+   cleanup(): Promise<void>;
+  /** M6.2: wizard surfaces (present when overrides.setup was given). */
+  setupAccess?: SetupAccess;
+  setupManager?: SetupManager;
+  /** record captured by the default scripted bringUp (null until finish()). */
+  savedRecord: { current: StoredConfigV1 | null };
+  /** live mode cell (tests assert SETUP->STANDBY->ACTIVE after finish). */
+  modeBox: AddonModeBox;
+  /** mutable knobs tests flip between verify runs. */
+  setupProbe: { held: boolean; detail: string };
+  setupSelfFetch: { current: ((url: string) => Promise<string | null>) | null };
 }
 
 /** Grab a free TCP port atomically-ish (bind 0, read it, close). */
@@ -64,6 +76,14 @@ export async function buildTestServer(
     telegramRedis?: boolean;
     /** M6.1: inject a service-mode cell (standby/setup/draining route tests). */
     modeBox?: AddonModeBox;
+    /** M6.2: scripted wizard deps (the harness builds redis-less SetupDeps). */
+    setup?: {
+      idleMs?: number;
+      loginFactory: LoginFactory;
+      selfFetcher?: (url: string) => Promise<string | null>;
+      leaseProbe?: { held: boolean; detail: string };
+      bringUp?: (record: StoredConfigV1) => Promise<{ ok: boolean; message?: string }>;
+    };
     /** passthrough env overrides (M5: MONTHLY_BYTES_BUDGET, BOOT_AUTH_*...) */
     extraEnv?: Record<string, string | undefined>;
   } = {},
@@ -95,14 +115,52 @@ export async function buildTestServer(
   });
   const redis = overrides.redisUrl ? openRedisStore({ url: overrides.redisUrl, timeoutMs: 200, snapshot: false }) : null;
   const telegram = new TelegramManager(cfg, overrides.telegramRedis ? redis : null);
+  const modeBox: AddonModeBox = overrides.modeBox ?? { mode: "active" };
+  const savedRecord: { current: StoredConfigV1 | null } = { current: null };
+  const setupProbe = {
+    held: overrides.setup?.leaseProbe?.held ?? true,
+    detail: overrides.setup?.leaseProbe?.detail ?? "lease available (test)",
+  };
+  const setupSelfFetch: { current: ((url: string) => Promise<string | null>) | null } = {
+    current: overrides.setup?.selfFetcher ?? null,
+  };
+  let setupDeps: SetupDeps | undefined;
+  if (overrides.setup) {
+    const s = overrides.setup;
+    setupDeps = {
+      cfg,
+      configStore: new ConfigStore({ key: cfg.configKey, filePath: path.join(dir, "config.enc") }),
+      redis: null,
+      loginFactory: s.loginFactory,
+      // default scripted bringUp: capture the record and flip SETUP->STANDBY->ACTIVE
+      bringUp:
+        s.bringUp ??
+        (async (record) => {
+          savedRecord.current = record;
+          modeBox.mode = "standby";
+          await new Promise((r) => setTimeout(r, 5));
+          modeBox.mode = "active";
+          return { ok: true };
+        }),
+      leaseProbe: async () => ({ ...setupProbe }),
+      selfFetcher: (url) =>
+        setupSelfFetch.current
+          ? setupSelfFetch.current(url)
+          : fetch(url)
+              .then((r) => (r.ok ? r.text() : null))
+              .catch(() => null),
+      idleMs: s.idleMs,
+    };
+  }
   const app = buildServer({
     config: cfg,
     db,
     telegram,
     redis,
     rateLimiter: overrides.rateLimiter,
-    modeBox: overrides.modeBox,
-  }) as AugmentedApp;
+    modeBox,
+    setup: setupDeps,
+  }) as AugmentedApp & { setup?: { access: SetupAccess; manager: SetupManager } };
   await app.listen({ port, host: "127.0.0.1" });
   const baseUrl = `http://127.0.0.1:${port}`;
   const tracks: TrackRow[] = [];
@@ -121,7 +179,23 @@ export async function buildTestServer(
     db.close();
     rmSync(dir, { recursive: true, force: true });
   };
-  return { app, baseUrl, db, cfg, telegram, dir, tracks, redis, cleanup };
+  return {
+    app,
+    baseUrl,
+    db,
+    cfg,
+    telegram,
+    dir,
+    tracks,
+    redis,
+    cleanup,
+    modeBox,
+    savedRecord,
+    setupProbe,
+    setupSelfFetch,
+    setupAccess: app.setup?.access,
+    setupManager: app.setup?.manager,
+  };
 }
 
 /** GET a JSON payload under the test secret. */
