@@ -9,10 +9,44 @@ src/            server.ts (routes, media proxy) · db.ts (SQLite+FTS5) · indexe
                 (track ids, metadata cleaning, §4.5 quality tiers) · telegram.ts ·
                 media.ts (ranges + admission control) · sign.ts (HMAC tokens) · config.ts
 scripts/        seed-fixture.ts · session.mjs (M1) · channels.mjs (M1)
-test/           contract/range/query/admission/fault/m1/m2/m3/m4 suites + fake-redis + soak
+test/           contract/range/query/admission/fault/m1/m2/m3/m4/m6 suites + fake-redis + soak
 ```
 
-## Quick start (dev)
+## Quick start (Render, ~10 minutes, no terminal)
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AnilRana675/MystoTune)
+
+1. Click the button: Render opens a Blueprint preview with **one web
+   service** (Docker runtime, health check `/healthz`, auto-deploy off) and
+   **one Key Value store** (free plan). Apply / Create Resources — the
+   `APP_SEED` secret is generated for you and `REDIS_URL` is wired to the
+   Key Value store automatically.
+2. On the web service's first deploy, open **Events → Logs** for the line
+   `[setup] open https://<service>.onrender.com/<secret>/setup#t=<token>`.
+   That link carries a one-time 144-bit setup token in a `#t=` fragment —
+   fragments never travel in a page GET, only in the single unlock POST —
+   and it unlocks a 30-minute HttpOnly cookie session.
+3. On the setup wizard do exactly four things:
+   - **Telegram access** — paste your API ID + API hash from my.telegram.org,
+   - **Login** — phone → code (→ 2FA password if you have one) using a
+     dedicated Telegram account (section 8 of the M6 spec; 5 wrong unlock
+     attempts lock the IP for 15 minutes),
+   - **Channels** — pick your music channels; you can preview each channel's
+     audio count via the Telegram music filter,
+   - **Options** — download permission and monthly bandwidth budget.
+4. Press **Verify**: every row (Redis, Telegram, each channel, audio, public
+   URL, lease) has to be green, then **Finish** — the addon swaps
+   SETUP → STANDBY → ACTIVE without a terminal.
+5. Open BitChord with your service's onrender.com URL and play.
+   `config.enc` lives encrypted in the Key Value store; if the free store
+   ever wipes it, setup re-opens cleanly and you run the wizard again.
+
+Ops notes: deploys are manual (auto-deploy off — this is what makes the
+Redis session-lease hand-over safe, doc §7.11), redeploys overlap for ≤15 s
+without killing your Telegram session, and a failed login re-opens setup
+with a banner. Details in `docs/render.md`.
+
+## Local development
 
 ```bash
 npm install
@@ -211,3 +245,19 @@ stays the default image for its glibc `MALLOC_ARENA_MAX` support).
   (SETUP→STANDBY→ACTIVE; failed swap = `startup_pending` 503 + retry) and
   404s every `/setup` route afterwards. New modules: `src/setup.ts`
   (SetupAccess/SetupManager) + scripted-login test seams; 131/131 tests.
+- **M6.3 ✅ Render Blueprint + deploy-first docs (doc 7.10, FR-30)** —
+  `render.yaml`: one Docker web service (`plan: free`, region singapore,
+  health check `/healthz`, `autoDeploy: false` so git pushes never
+  redeploy into your session, `maxShutdownDelaySeconds: 30` covers the
+  10 s drain) + one free Key Value store (`ipAllowList: []`,
+  `maxmemoryPolicy: noeviction` protects `cfg:v1`); `APP_SEED` via
+  `generateValue` and `REDIS_URL` wired with `fromService` connectionString;
+  **no** Telegram/env secrets in the file — the wizard owns them.
+  README Quick Start rewritten deploy-first (button → Blueprint preview →
+  wizard from the `[setup] open …#t=` log line → verify → finish), the old
+  dev flow kept under "Local development", and `docs/render.md` carries the
+  ops notes (redeploy lease hand-over, APP_SEED handling, failure modes).
+  Schema-validated against render.com/schema/render.yaml.json.
+  Manual acceptance stays open on a real Render account: fresh account to
+  first play ≤ 10 min, MP3 + FLAC, five consecutive redeploys without
+  `AUTH_KEY_DUPLICATED`.

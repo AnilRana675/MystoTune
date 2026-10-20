@@ -1,0 +1,42 @@
+# BitChord Telegram Addon — Render Blueprint (M6 doc §7.10, FR-30)
+#
+# One web service + one Key Value store. Validate against
+# https://render.com/schema/render.yaml.json before changing anything here.
+#
+# What the Blueprint does NOT contain, on purpose (doc §7.3): Telegram API
+# id/hash, the session string, channels and options are collected by the
+# setup wizard (src/setup.ts) and stored encrypted in this Key Value store
+# under cfg:v1. env sync:false is avoided for anything that changes; the
+# only generated secret (APP_SEED) is created once with generateValue.
+#
+# Keep APP_SEED stable after first boot: ADDON_SECRET, MEDIA_SIGNING_KEY and
+# the config-store key are HKDF-derived from it — rotating it bricks the
+# stored config until the wizard is re-run.
+
+services:
+  - type: web
+    name: mystotune
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /healthz
+    autoDeploy: false
+    # The drain (doc §7.11) waits up to 10 s for active streams after
+    # SIGTERM; give the process room so wipes are graceful, not severed.
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: APP_SEED
+        generateValue: true
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: mystotune-kv
+          property: connectionString
+  - type: keyvalue
+    name: mystotune-kv
+    plan: free
+    region: singapore
+    ipAllowList: []
+    # noeviction: cfg:v1 (config) and snapshot keys must never be evicted to
+    # keep rate-limit buckets; losing the config store re-opens the wizard.
+    maxmemoryPolicy: noeviction

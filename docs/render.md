@@ -1,68 +1,160 @@
-# Deploying the BitChord Telegram Addon on Render (§4.15)
+# Rendering MystoTune on Render — ops notes
 
-TRD v2.2 FINAL section 4.15 defines a **Render free-plan profile** for the
-addon: ephemeral disk, port-from-env, cold-start patience for Telegram, boot
-auth-overlap retries, and a monthly egress budget that degrades gracefully
-instead of letting Render suspend the service.
+Two layers: the **Blueprint** (`render.yaml`, doc §7.10, FR-30) that
+creates the resources, and the **free-plan profile** (TRD §4.15) the
+runtime has honoured since M5. The README Quick Start is the 10-minute
+happy path; this page is everything after day one.
 
-The stock `Dockerfile` works unchanged (`BASE_IMAGE=node:22-slim` is the
-default build arg; EXPOSE 8080; `CMD node dist/src/server.js`). No Render
-image building or compose changes are required.
+## What the Blueprint creates
 
-## Boot order the server already implements
+| Resource | Spec | Why |
+| :------- | :--- | :-- |
+| Web service `mystotune` | `runtime: docker`, `plan: free`, region `singapore`, health check `/healthz` | Builds the repo Dockerfile (multi-stage, non-root, `/data` owned by `node`) |
+| Key Value `mystotune-kv` | `plan: free`, `ipAllowList: []`, `maxmemoryPolicy: noeviction` | Holds `cfg:v1` (encrypted config), the lease key and the index snapshot |
+| `APP_SEED` | `generateValue: true` | Base64 256-bit root key; HKDF derives `ADDON_SECRET`, `MEDIA_SIGNING_KEY` and the config-store key (§7.3) |
+| `REDIS_URL` | `fromService: keyvalue … connectionString` | Wired automatically — no manual paste |
+
+Two deliberate settings:
+
+- **`autoDeploy: false`** — a git push must not redeploy: deploys briefly
+  run a second instance, and the session lease (below) owns that overlap.
+  Use *Deploy latest commit*.
+- **`maxShutdownDelaySeconds: 30`** — the drain waits up to 10 s for
+  active streams after SIGTERM; 30 s keeps the shutdown graceful.
+
+## First deploy (M6 setup wizard)
+
+1. README → **Deploy to Render** button → the Blueprint preview shows
+   exactly two resources → apply.
+2. The first build is a Docker build. On boot the service enters **SETUP**
+   (no Telegram session in env or store) and serves a valid manifest with
+   an empty search index; `/healthz` stays 200.
+3. Open the service **Logs** and find
+   `[setup] open https://<service>.onrender.com/<secret>/setup#t=<token>`.
+   The token is 144-bit random, minted per boot; it lives in the URL
+   fragment (a fragment never rides a page GET) and unlocks a 30-minute
+   HttpOnly `SameSite=Strict` cookie paired with an `x-setup-csrf` header.
+4. Wizard: API id/hash from my.telegram.org → phone → code (→ 2FA
+   password) → channels → options → **Verify** (all rows green) →
+   **Finish**. Everything is stored **encrypted (AES-256-GCM with an
+   APP_SEED-derived key)** as `cfg:v1` in the Key Value store — the phone
+   number is never stored — then the process swaps SETUP → STANDBY →
+   ACTIVE. All `/setup/*` routes 404 afterwards.
+5. BitChord opens the addon by its public URL. Lockout: 5 wrong unlock
+   attempts lock the IP for 15 minutes; the global cap is 20 unlock
+   attempts per hour.
+
+## Deploys, spins and the session lease (§7.11)
+
+- Redeploying starts the new instance in **STANDBY**: it polls the lease
+  `lease:session:{0}` every 5 s (`SET NX PX 45 s`) while the old instance
+  still holds it; `/healthz` returns 200 in STANDBY, which is what keeps
+  Render on the old instance until the new one proves itself.
+- The old instance gets SIGTERM → **DRAINING**: active streams finish for
+  up to 10 s, new `/stream` and `/media` requests answer
+  `503 Retry-After: 5`, then it compare-and-deletes the lease and exits.
+  Expected music gap ≤ 15 s and **no `AUTH_KEY_DUPLICATED`** — that fatal
+  error means two Telegram clients shared one session string, which the
+  lease exists to make impossible.
+- If a live instance misses renewals for ~30 s it self-fences (drops
+  Telegram I/O, back to STANDBY) instead of streaming alongside a rival.
+- Without Redis the M5 fallback still applies: boot absorbs the overlap
+  with `BOOT_AUTH_RETRIES=3` spaced `BOOT_AUTH_RETRY_WAIT_SECONDS=60`
+  apart, so a broken `REDIS_URL` degrades to M5 behaviour, not to outage.
+
+## Boot order (unchanged since M5, wrapped in the M6 state machine)
 
 1. Fastify listens on `$PORT` (bind `0.0.0.0`) before Telegram connects.
-2. `REDIS_SNAPSHOT=1` restores `index:snapshot` (tracks **and** sync cursors)
-   from Redis when the ephemeral SQLite index is empty — **before** Telegram
-   connects. Storage rule (§4.11 rule 5): cursors live in SQLite normally; the
-   snapshot additionally carries them for ephemeral-disk hosts.
+   `/healthz` answers from the first request (mode `setup`, `standby`,
+   `active`… in state-machine order).
+2. `REDIS_SNAPSHOT=1` restores `index:snapshot` (tracks **and** sync
+   cursors) from Redis when the ephemeral SQLite index is empty — before
+   Telegram connects. Storage rule (§4.11 rule 5): cursors live in SQLite
+   normally; the snapshot additionally carries them for ephemeral-disk
+   hosts.
 3. Telegram connects last; `/stream` and `/media` wait up to 10 s for the
-   client when the state is still `connecting`, then answer
-   `503 Retry-After: 5`.
-4. If the session is already in use elsewhere (`AUTH_KEY_DUPLICATED`), boot
-   retries `BOOT_AUTH_RETRIES` times spaced `BOOT_AUTH_RETRY_WAIT_SECONDS`
-   apart before declaring fatal — this absorbs the overlap window when Render
-   swaps instances while the old deployment still holds the session.
+   client when the state is still `connecting`, then `503 Retry-After: 5`.
+   BitChord treats those as normal cold-start flaps and falls back.
 
-## Environment variables
+## Environment variables (after M6)
 
-| Variable                          | Value at Render                          | Notes                                                            |
-| --------------------------------- | ---------------------------------------- | ---------------------------------------------------------------- |
-| `PORT`                            | *(Render default, do not set)*           | read from env, default 8080 locally; server binds `0.0.0.0`       |
-| `PUBLIC_BASE_URL`                 | `https://<your-service>.onrender.com`    | must be https in production (omit `ALLOW_INSECURE_BASE_URL`)      |
-| `ADDON_SECRET`                    | 32+ char random                          | the manifest/search/stream secret prefix                          |
-| `MEDIA_SIGNING_KEY`               | base64 of 32 random bytes                | signs `/media` + `/art` tokens — rotate ⇒ old URLs expire         |
-| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` / `TELEGRAM_SESSION` | provisioned via `npm run session` | never commit these |
-| `REDIS_URL`                       | free Render Key Value (or Upstash)       | required for the snapshot restore path                            |
-| `REDIS_SNAPSHOT`                  | `1`                                      | index dump after each sync; replayed on cold boot                 |
-| `MONTHLY_BYTES_BUDGET`            | `4500000000` (4.5 GB default)            | egress counter in Redis `bytes:month` (UTC-month TTL); when exceeded `/stream` and `/media` answer a plain `404` so BitChord falls back instead of the host suspending |
-| `ALLOW_DOWNLOADS`                 | `0` (recommended at Render)              | keeps manifest `allowDownloads:0` to discourage client-side downloads on the free plan |
-| `BOOT_AUTH_RETRIES`               | `3`                                      | boot retries for `AUTH_KEY_DUPLICATED` (deploy overlap)            |
-| `BOOT_AUTH_RETRY_WAIT_SECONDS`    | `60`                                     | spacing between boot retries                                      |
+The wizard owns the Telegram-facing settings — they are **not** Blueprint
+env vars and should not be pasted into the dashboard:
 
-`MONTHLY_BYTES_BUDGET=0` disables the budget entirely (local deployments).
+| Variable | At Render | Notes |
+| :------- | :-------- | :---- |
+| `APP_SEED` | generated by the Blueprint | Never rotate; see below |
+| `REDIS_URL` | `fromService` connectionString | Wired automatically |
+| `PORT` / `RENDER_EXTERNAL_URL` | injected by Render | Server binds `0.0.0.0`; the external URL feeds `PUBLIC_BASE_URL`; `PROFILE` autodetects `render` |
+| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` / `TELEGRAM_SESSION` | via the wizard | Alternative: set as env for pre-configured boots (M5 style) — wizard then never opens |
+| channels / options (`MONTHLY_BYTES_BUDGET`, `ALLOW_DOWNLOADS`) | via the wizard | Or set as env — env wins over the store (§7.3) |
+| `REDIS_SNAPSHOT` | `1` | index dump after each sync; replayed on cold boot |
+| `LEASE_TTL_MS` / `LEASE_RENEW_MS` / `LEASE_POLL_MS` / `DRAIN_MS` | profile defaults (45/15/5 s, 10 s) | Tune only if you know why |
+| `SETUP_ENABLED` | `auto` — on while unconfigured | `off` 404s every setup route without deleting the wizard |
 
-## Docker / image notes
+`MONTHLY_BYTES_BUDGET` (default 4.5 GB) keeps the counters in Redis
+`bytes:month` (UTC-month TTL); when exceeded, `/stream` / `/media` answer
+a plain 404 so BitChord falls back instead of Render suspending the
+service for egress abuse. `=0` disables the budget (local deployments).
 
-- `BASE_IMAGE` stays `node:22-slim` (the M3 benchmark winner — glibc
-  `MALLOC_ARENA_MAX` support; the TRD NODE_OPTIONS line includes
-  `--optimize-for-size` for cgroup-tuned JVM-style memory trimming, configured
-  via compose env, not the Dockerfile).
-- Non-root user owns `/data` — but on Render the disk is ephemeral, so
-  `REDIS_SNAPSHOT=1` is what makes cold starts warm.
+**Never rotate `APP_SEED`** while config exists in the store: it is the
+input to every derived secret (`ADDON_SECRET`, `MEDIA_SIGNING_KEY`, the
+config-store key), so rotating it makes `cfg:v1` unreadable and the addon
+boots back to SETUP. Secrets that may change (Telegram credentials,
+options) are safe — the wizard rewrites `cfg:v1`.
 
 ## Free-plan operational notes
 
-- **Region: Singapore** — the TRD picks the region that minimizes Telegram DC
-  RTT for the posting time zones involved; keep Telegram geometry in mind if
-  you repoint the service (DC warm-touching adapts automatically).
-- **Idle spin-down:** free web services sleep after ~15 min without inbound
-  traffic. On wake, the boot order above runs again: Fastify first, snapshot
-  restore, then Telegram. BitChord sees only normal 503 cold-start replies
-  for up to 10 s — it treats them as regular flaps and falls back.
-- **Cold standby with a second account:** Telegram authorizes one session per
-  account, so the cheap way to keep a warm instance is a second Telegram
-  account (its own string session) hosting a standby deployment. When the
-  primary is asleep, BitChord's 503 fallbacks handle transfers; never share a
-  `TELEGRAM_SESSION` across two live instances — that is exactly the
-  `AUTH_KEY_DUPLICATED` overlap the boot retries absorb at deploy boundaries.
+- **Region: Singapore** — chosen to minimize Telegram DC RTT for the
+  posting time zones involved; keep Telegram geometry in mind if you
+  repoint (DC warm-touching adapts automatically).
+- **Idle spin-down:** free web services sleep after ~15 min without
+  inbound traffic. On wake, the boot order runs again: server first,
+  snapshot restore, then Telegram. Expect normal `503` cold-start
+  replies for up to 10 s.
+- **Storage is ephemeral** on the web service: `REDIS_SNAPSHOT=1` is what
+  makes cold starts warm, and the encrypted `cfg:v1` in the Key Value
+  store is why a re-deploy alone never loses the wizard's work. If the
+  free Key Value plan ever wipes it, setup re-opens cleanly — run the
+  wizard again (or upgrade the plan).
+- **Second account / second deployment:** Telegram authorizes one live
+  session per account; the cheap warm standby is a *second Telegram
+  account (own session, own Blueprint, own Key Value)*. Two Render
+  accounts must never share a lease, store or session string — never load
+  balance — and check Render's terms first (§13).
+
+## Failure modes (§7.2)
+
+| Symptom | Cause | Recovery |
+| :------ | :---- | :------- |
+| `/healthz` says `"mode":"setup"` after a working period | Key Value lost `cfg:v1` or a fresh store | Run the wizard again |
+| Verify row `public_url` red | Manifest not reachable under `PUBLIC_BASE_URL` (usually http) | Use the `https://<service>.onrender.com` URL; setup cookies are Secure-flagged |
+| Verify row `lease` red | Another instance holds the lease or `REDIS_URL` wrong | Wait 45 s for expiry/takeover, or verify the connection string |
+| Setup API 403 | Missing/expired 30-min cookie, wrong `x-setup-csrf`, cross-origin host, or IP unlocked-cap | Re-open from a fresh log token |
+| Setup routes 404 | Wizard already finished, or `SETUP_ENABLED=off` | Expected after finish; a wiped store re-opens it |
+| Fatal in logs (`AUTH_KEY_UNREGISTERED`, session invalid) | Session revoked/expired | `mode: "failed"`; setup re-opens with a banner and a **new token in the logs** |
+| `AUTH_KEY_DUPLICATED` in logs at boot | Two instances shared one session | M6: transient at overlap, boot retries absorb it; persistent ⇒ file an issue with boot logs |
+| Verify row `telegram` red / flood errors | Telegram rate limits or flagged a data-centre login | Wait (flood_wait surfaces with Retry-After); worst case log in locally and paste the session string into the wizard or env (§13) |
+
+## Session hygiene
+
+- The wizard account should be **dedicated** — the session is a Telegram
+  credential that can read every chat it can see. Never reuse a personal
+  account (§8).
+- The session string lives only encrypted in `cfg:v1`; it never appears
+  in logs. If you export it (e.g. for the M5 env path), keep it out of
+  tickets, screenshots and repo files.
+- The setup token is per-boot and unguessable, the cookie is
+  `HttpOnly SameSite=Strict`, and every `/setup/*` route dies after
+  finish — do not widen these.
+
+## Mk. Checklist before M6.3 sign-off (§11)
+
+- [x] Blueprint validates against https://render.com/schema/render.yaml.json
+- [x] Deploy button link: `https://render.com/deploy?repo=https://github.com/AnilRana675/MystoTune`
+- [x] README Quick Start rewritten — deploy-first, no terminal
+- [x] Free Key Value plan exists (per Render plans; re-check before sign-off)
+- [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)
+- [ ] Play one MP3 and one FLAC from the deployed instance
+- [ ] Five consecutive redeploys without `AUTH_KEY_DUPLICATED` (the lease
+      code + fake-Redis tests cover the mechanism; the drill is manual)
