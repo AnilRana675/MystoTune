@@ -1080,7 +1080,7 @@ async function makeGramJSLoginFactory(): Promise<LoginFactory> {
   };
   const log = new Logger(LogLevel.ERROR);
   const userOf = (u: unknown): { id: number; name: string } => {
-    const user = u as { id?: { toString(): string }; firstName?: string; lastName?: string; username?: string };
+    const user = (u ?? {}) as { id?: { toString(): string }; firstName?: string; lastName?: string; username?: string };
     const name = [user.firstName, user.lastName].filter(Boolean).join(" ") || String(user.username ?? "telegram user");
     return { id: Number(user.id?.toString() ?? 0), name };
   };
@@ -1103,6 +1103,11 @@ async function makeGramJSLoginFactory(): Promise<LoginFactory> {
             password: cb.password,
             onError: () => undefined, // gramJS requires the hook; errors surface via the pending callback promises
           })
+          // gramJS 2.26.22 resolves start() as undefined on every path
+          // (client/auth.js L41-53: the already-authorized branch returns
+          // bare, and the post-flow result is never propagated). start
+          // resolving IS the "authorized" signal — getMe() is valid there.
+          .then(() => client.getMe())
           .then(userOf),
       whoAmI: async () => userOf(await client.getMe()),
       dialogs: async () => {
