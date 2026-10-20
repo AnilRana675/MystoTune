@@ -67,7 +67,7 @@ headers are committed, so cold/FloodWait/expired-reference failures surface as r
 ## Tests & soak
 
 ```bash
-npm test                        # 105 assertions across contract/range/query/admission/fault/m1/m2/m3/m4
+npm test                        # 117 assertions across contract/range/query/admission/fault/m1/m2/m3/m4/m6
 npm run soak -- --seconds 60 --no-budget --out docs/m5-soak-baseline.json
 ```
 
@@ -164,4 +164,19 @@ stays the default image for its glibc `MALLOC_ARENA_MAX` support).
   Telegram connects. Deploy guide: `docs/render.md`.
   Tests: 105/105 across contract/range/query/admission/fault/m1/m2/m3/m4 (M5
   cases live in range/admission/fault; the m4 migration test also asserts the
-  new schema v3).
+  new schema v3). Incremented later by M6.0 (see below).
+- **M6.0 ✅ foundations (M6 spec §1)** — derived secrets (FR-29): `APP_SEED`
+  (Blueprint `generateValue` or `openssl rand -base64 32`) feeds HKDF-SHA256
+  (salt `mystotune/v1`, infos `addon-path` 24 B → base64url 32-char
+  `ADDON_SECRET`, `media-signing` 32 B, `config-store` 32 B); explicit env
+  still wins, and pre-M6 `.env` boots derive a stable config key from their
+  explicit `ADDON_SECRET`+`MEDIA_SIGNING_KEY`. Config store (FR-28):
+  plaintext `{v, apiId, apiHash, sessions[], channels[], options{…}}`
+  encrypted AES-256-GCM (random 12-byte IV) as `base64url(iv|tag|ct)` under
+  Redis `cfg:v1` (no TTL) with a `/data/config.enc` 0600 fallback — phone is
+  never stored and every write is verified by read-back decrypt. Config
+  resolution (§7.3) becomes env > store > profile > built-ins via
+  `applyStoredConfig`; `PROFILE` autodetects `render` when `RENDER=true`;
+  `PUBLIC_BASE_URL` falls back to `RENDER_EXTERNAL_URL`; new envs
+  `SETUP_ENABLED`, `LEASE_TTL_MS`/`LEASE_RENEW_MS`/`LEASE_POLL_MS`/`DRAIN_MS`/
+  `SESSION_SLOTS`. Tests: 117/117 incl. new `test/m6.test.ts`.

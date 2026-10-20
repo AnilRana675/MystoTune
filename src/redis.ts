@@ -27,6 +27,9 @@ const FLOOD_KEY = "flood:until";
 const SNAPSHOT_KEY = "index:snapshot";
 /** §4.15 Render profile: monthly streamed-bytes counter (UTC month TTL). */
 const BYTES_MONTH_KEY = "bytes:month";
+/** M6 config store (doc 7.4): encrypted configuration blob. No TTL — this is
+ * durable state, unlike every other key in this module. */
+const CONFIG_STORE_KEY = "cfg:v1";
 
 /** Seconds until the end of the current UTC month (min 60 so a month-end
  * write still lands briefly). The counter self-resets at the month roll. */
@@ -89,6 +92,13 @@ export interface RedisStore {
   addBytesMonth(n: number): void;
   /** Reads the counter; 0 on any failure/time-out (never blocks streaming). */
   readBytesMonth(): Promise<number>;
+
+  /* M6 config store (doc 7.4): encrypted config blob, cfg:v1, no TTL */
+  /** Reads the blob; null on miss, failure, or time-out (caller falls back). */
+  readConfigBlob(): Promise<string | null>;
+  /** Fire-safe write of the blob; failures are swallowed (verify happens in
+   * configStore.save() via read-back). */
+  writeConfigBlob(blob: string): void;
 
   close(): void;
 }
@@ -255,6 +265,22 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
         else stats.errors += 1;
         return 0;
       }
+    },
+
+    async readConfigBlob() {
+      try {
+        const v = await withTimeout(client.get(CONFIG_STORE_KEY), timeoutMs);
+        return v || null;
+      } catch (e) {
+        if ((e as { code?: string })?.code === "REDIS_CMD_TIMEOUT") stats.timeouts += 1;
+        else stats.errors += 1;
+        return null; // caller falls back to the durable file store
+      }
+    },
+
+    writeConfigBlob(blob) {
+      if (typeof blob !== "string" || blob.length === 0) return;
+      void withTimeout(client.set(CONFIG_STORE_KEY, blob), timeoutMs).catch(() => undefined);
     },
 
     async getDocMeta(id) {

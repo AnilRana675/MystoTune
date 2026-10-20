@@ -11,7 +11,8 @@ import Fastify, { LogController, type FastifyInstance, type FastifyReply, type F
 import { createHash, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 
-import { RATE_LIMITS, loadConfig, type AppConfig } from "./config";
+import { RATE_LIMITS, applyStoredConfig, loadConfig, type AppConfig } from "./config";
+import { ConfigStore, DEFAULT_CONFIG_FILE } from "./configStore";
 import {
   countTracks,
   createSchema,
@@ -849,10 +850,18 @@ export async function bootTelegram(
 }
 
 export async function main(): Promise<void> {
-  const cfg = loadConfig();
+  let cfg = loadConfig();
   const db = openDb(cfg.dbPath);
   createSchema(db);
   const redis = openRedisStore({ url: cfg.redis.url, timeoutMs: cfg.redis.timeoutMs, snapshot: cfg.redis.snapshot });
+
+  // M6.0 (doc 7.3): second layer of "env > store > profile". The encrypted
+  // store fills only what explicit env left unset; a tampered/unreadable
+  // store (e.g. rotated APP_SEED) simply falls back to env-only boot.
+  const configStore = new ConfigStore({ key: cfg.configKey, redis, filePath: DEFAULT_CONFIG_FILE });
+  const storedRecord = await configStore.load().catch(() => null);
+  cfg = applyStoredConfig(cfg, storedRecord);
+
   const telegram = new TelegramManager(cfg, redis);
   const indexer = new IndexIndexer(db, telegram, cfg, undefined, redis);
   const app = buildServer({ config: cfg, db, telegram, indexer, redis });
