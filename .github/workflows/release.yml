@@ -2,9 +2,10 @@ name: release
 
 # Release automation (repo ops): every push to main installs, typechecks, and
 # test-gates; a push that bumps the version in package.json to one without a
-# v<version> tag gets that tag + a GitHub Release with auto-generated notes.
-# Regular commits release nothing (idempotent by tag existence), and Render
-# deploys stay independent (autoDeploy:false, Manual Deploy).
+# v<version> tag gets that tag + a GitHub Release whose notes are composed by
+# scripts/release-notes.mjs (README roadmap highlight + commit list + diff
+# link). An existing release's notes get refreshed on later pushes, so the
+# page stays current. Render deploys stay independent (autoDeploy:false).
 
 on:
   push:
@@ -24,7 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history incl. tags, for the existence check
+          fetch-depth: 0 # full history for the commit-range notes
+          fetch-tags: true # checkout@v4 does NOT fetch tags by default; the
+                           # release composer needs previous v* tags
 
       - uses: actions/setup-node@v4
         with:
@@ -48,16 +51,25 @@ jobs:
             echo "v=$V" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Tag and publish the release
-        if: steps.version.outputs.new == 'true'
+      - name: Compose notes, then publish or refresh the release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.v }}
         run: |
-          git config user.name "mystotune-release-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "v$VERSION" "$GITHUB_SHA"
-          git push origin "v$VERSION"
-          gh release create "v$VERSION" \
-            --title "BitChord Telegram Addon v$VERSION" \
-            --generate-notes
+          PREV="$(git tag --list 'v*' --sort=-creatordate | grep -vx "v$VERSION" | head -1 || true)"
+          echo "previous tag: ${PREV:-none}"
+          node scripts/release-notes.mjs --version "$VERSION" --prev "$PREV" \
+            --repo "${{ github.repository }}" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            # tag already out — refresh its notes (keeps the page current)
+            gh release edit "v$VERSION" --notes-file "$RUNNER_TEMP/notes.md" || true
+          else
+            git config user.name "mystotune-release-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "v$VERSION" "$GITHUB_SHA"
+            git push origin "v$VERSION"
+            gh release create "v$VERSION" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              --title "BitChord Telegram Addon v$VERSION"
+          fi
