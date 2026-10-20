@@ -712,10 +712,12 @@ test("setup wizard end to end: login, channels, failing then passing verify, fin
     await untilStatus(ts, (s) => s.loginError?.code === "phone_code_invalid");
     assert.equal(logins[0]!.closeCount, 1, "failed login discarded (§8 remnants)");
 
-    // restart works: phone again, right code parks on the password step
+    // restart works: phone again, right code answers password_needed (2FA is on)
     assert.equal((await setupPost(ts, auth, "/api/login/phone", { phone: "+9779812345675" })).status, 200);
     await untilStatus(ts, (s) => s.loginPhase === "code");
-    assert.equal((await setupPost(ts, auth, "/api/login/code", { code: "12345" })).status, 200);
+    const pwAsk = await setupPost(ts, auth, "/api/login/code", { code: "12345" });
+    assert.equal(pwAsk.status, 400);
+    assert.equal(((await pwAsk.json()) as { code: string }).code, "password_needed");
     await untilStatus(ts, (s) => s.loginPhase === "password");
     // wrong 2FA password → password_invalid, no lockout
     const badPw = await setupPost(ts, auth, "/api/login/password", { password: "nope" });
@@ -729,7 +731,8 @@ test("setup wizard end to end: login, channels, failing then passing verify, fin
     // restart once more and complete the login
     assert.equal((await setupPost(ts, auth, "/api/login/phone", { phone: "+977981234565" })).status, 200);
     await untilStatus(ts, (s) => s.loginPhase === "code");
-    assert.equal((await setupPost(ts, auth, "/api/login/code", { code: "12345" })).status, 200);
+    const pwAsk2 = await setupPost(ts, auth, "/api/login/code", { code: "12345" });
+    assert.equal(pwAsk2.status, 400); // 2FA: park on the password valve
     await untilStatus(ts, (s) => s.loginPhase === "password");
     assert.equal((await setupPost(ts, auth, "/api/login/password", { password: "s3cret" })).status, 200);
     const done = await untilStatus(ts, (s) => s.loginPhase === "done");
@@ -873,7 +876,7 @@ test("setup finish: a failed bring-up answers startup_pending 503; a retry can p
     assert.equal((await setupPost(ts, auth, "/api/creds", { apiId: 12345, apiHash: CRED_API_HASH })).status, 200);
     assert.equal((await setupPost(ts, auth, "/api/login/phone", { phone: "+977981234567" })).status, 200);
     await untilStatus(ts, (s) => s.loginPhase === "code");
-    assert.equal((await setupPost(ts, auth, "/api/login/code", { code: "12345" })).status, 200);
+    assert.equal((await setupPost(ts, auth, "/api/login/code", { code: "12345" })).status, 400); // 2FA park
     await untilStatus(ts, (s) => s.loginPhase === "password");
     assert.equal((await setupPost(ts, auth, "/api/login/password", { password: "s3cret" })).status, 200);
     await untilStatus(ts, (s) => s.loginPhase === "done");
@@ -910,7 +913,7 @@ test("setup idle: inactivity discards the login and surfaces login_idle (doc 7.6
     assert.equal((await setupPost(ts, auth, "/api/creds", { apiId: 12345, apiHash: CRED_API_HASH })).status, 200);
     assert.equal((await setupPost(ts, auth, "/api/login/phone", { phone: "+977981234567" })).status, 200);
     await untilStatus(ts, (s) => s.loginPhase === "code");
-    assert.equal((await setupPost(ts, auth, "/api/login/code", { code: "12345" })).status, 200);
+    assert.equal((await setupPost(ts, auth, "/api/login/code", { code: "12345" })).status, 400); // 2FA park
     await untilStatus(ts, (s) => s.loginPhase === "password");
     assert.equal((await setupPost(ts, auth, "/api/login/password", { password: "s3cret" })).status, 200);
     await untilStatus(ts, (s) => s.loginPhase === "done");

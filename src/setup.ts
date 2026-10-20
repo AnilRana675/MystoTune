@@ -416,6 +416,12 @@ export class SetupManager {
     this.codeValve!.deliver(code);
     this.codeValve = null;
     await this.waitForPhase("code"); // settle → password needed, done, or error
+    if (this.loginPhase === "password") {
+      // The login parked on the password valve (2FA house). The wizard asks
+      // for the 2FA password only when the code POST fails with this code —
+      // answering 200 here would be a lie (the login is not done).
+      throw new SetupError("password_needed", "Two-step verification is on", "Show the password field");
+    }
     if (this.lastLoginError) throw this.lastLoginError;
     this.touch();
   }
