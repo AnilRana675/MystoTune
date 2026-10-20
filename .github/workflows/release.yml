@@ -1,0 +1,63 @@
+name: release
+
+# Release automation (repo ops): every push to main installs, typechecks, and
+# test-gates; a push that bumps the version in package.json to one without a
+# v<version> tag gets that tag + a GitHub Release with auto-generated notes.
+# Regular commits release nothing (idempotent by tag existence), and Render
+# deploys stay independent (autoDeploy:false, Manual Deploy).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history incl. tags, for the existence check
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # matches the runtime image (node:22-slim)
+          cache: npm
+
+      - name: Install, typecheck, test (release gate)
+        run: |
+          npm ci
+          npx tsc -p .
+          npm test
+
+      - name: Detect a new package.json version
+        id: version
+        run: |
+          V="$(node -p "require('./package.json').version")"
+          if git rev-parse -q --verify "refs/tags/v$V" >/dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+            echo "v=$V" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag and publish the release
+        if: steps.version.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.v }}
+        run: |
+          git config user.name "mystotune-release-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "v$VERSION" "$GITHUB_SHA"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" \
+            --title "BitChord Telegram Addon v$VERSION" \
+            --generate-notes
