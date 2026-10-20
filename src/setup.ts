@@ -105,6 +105,11 @@ export class SetupAccess {
     private readonly secure = false,
   ) {}
 
+  /** Constant-time check of the deploy-log token (session backup reveal). */
+  tokenOk(candidate: unknown): boolean {
+    return typeof candidate === "string" && maskedEqual(this.token, candidate);
+  }
+
   /** Remaining per-IP lock in seconds (0 = not locked; tallies don't lock). */
   ipLockedSec(ip: string, now = Date.now()): number {
     const f = this.failsByIp.get(ip);
@@ -314,6 +319,7 @@ export class SetupManager {
   private lastLoginError: SetupError | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private lastVerify: VerifyReport | null = null;
+  private backup: string | null = null; // one-time session reveal (doc §7.4)
 
   constructor(deps: SetupDeps) {
     this.deps = deps;
@@ -345,6 +351,8 @@ export class SetupManager {
       options: { allowDownloads: this.options.allowDownloads, monthlyBytesBudget: this.options.monthlyBytesBudget },
       verify: this.lastVerify,
       publicUrl: this.closed ? `${this.deps.cfg.publicBaseUrl}/${this.deps.cfg.addonSecret}` : null,
+      // The page shows the one-time reveal button while a backup is pending.
+      backupReady: this.closed && this.backup !== null,
     };
   }
 
@@ -514,9 +522,29 @@ export class SetupManager {
       throw new SetupError("startup_pending", outcome.message ?? "The service is still switching over", "Give it a few seconds, then retry", 503);
     }
     this.closed = true; // 7.9.4 — the setup site is closed from here on
+    this.backup = record.sessions[0] ?? null; // doc §7.4 — backup on the final screen
     await this.discardLogin(false); // §8 memory remnants cleared
     this.lastVerify = null;
     return { publicUrl: `${this.deps.cfg.publicBaseUrl}/${this.deps.cfg.addonSecret}` };
+  }
+
+  /**
+   * Session backup (doc §7.4): the deploy-log token reveals the finished
+   * session string exactly once, so it can be saved as TELEGRAM_SESSION_STRING
+   * against a free Redis plan losing data. Only after finish; never twice.
+   */
+  revealBackup(): { session: string } {
+    if (this.backup === null || !this.closed) {
+      throw new SetupError(
+        this.closed ? "gone" : "closed",
+        this.closed ? "The backup was already revealed — it is never shown twice" : "Setup has not finished yet",
+        this.closed ? "Redeploy to re-run the wizard, then boot from TELEGRAM_SESSION_STRING" : "Finish the wizard first",
+        404,
+      );
+    }
+    const session = this.backup;
+    this.backup = null; // doc §7.4 — "reveal the session string once"
+    return { session };
   }
 
   /** Full teardown (CPU-shutdown path in main too). */
@@ -799,9 +827,13 @@ button:disabled{opacity:.4}.hint{color:#9ab;font-size:.85rem}.banner{background:
 <section id="s-verify" class="hidden"><h1>Verify</h1><div id="v-rows"></div><button id="b-verify">Run checks</button><button id="b-finish" class="hidden">Finish setup</button><p id="v-err" class="hint"></p></section>
 <section id="s-done" class="hidden"><h1>Done</h1><p>Add the addon in BitChord: <b>Settings → Sources → Add an addon</b></p>
 <code id="d-url"></code><p><button id="b-copy" class="hidden" style="width:auto;padding:6px 12px">Copy URL</button></p>
-<p class="hint">Back up the session string shown on the status page in case Redis is lost. Setup is now closed.</p></section>
+<p><button id="b-session" class="hidden" style="width:auto;padding:6px 12px">Reveal session backup</button></p>
+<code id="d-session" class="hidden"></code>
+<p id="d-err" class="hint"></p>
+<p class="hint">Reveal the session string once and save it as TELEGRAM_SESSION_STRING in Render — a free Redis plan can lose data. Setup is now closed.</p></section>
 <script nonce="${nonce}">"use strict";
 var csrf=null;
+var tok=null;
 var S={welcome:"s-welcome",login:"s-login",channels:"s-channels",options:"s-options",verify:"s-verify",done:"s-done"};
 var base=location.pathname.replace(/\\/$/,"")+"/api/";
 function $(i){return document.getElementById(i)}
@@ -821,6 +853,7 @@ function rq(p,body){
 (function(){var m=/[#&]t=([A-Za-z0-9_-]+)/.exec(location.hash||"");
   if(!m){$("b-creds").disabled=true;msg("w-err","Open the setup link from the deploy logs — it ends in #t=…");return}
   history.replaceState(null,"",location.pathname);
+  tok=m[1];
   rq("unlock",{token:m[1]}).then(function(u){csrf=u.csrf},function(e){$("b-creds").disabled=true;msg("w-err","Unlock failed: "+e.message)})})();
 // 2. creds
 $("b-creds").onclick=function(){msg("w-err");
@@ -884,8 +917,17 @@ $("b-verify").onclick=function(){msg("v-err");$("b-verify").disabled=true;
 $("b-finish").onclick=function(){msg("v-err");$("b-finish").disabled=true;
   rq("finish",{}).then(function(out){$("d-url").textContent=out.publicUrl;setk("done");
     $("b-copy").className="";
-    $("b-copy").onclick=function(){try{navigator.clipboard.writeText(out.publicUrl)}catch(e){}}},
+    $("b-copy").onclick=function(){try{navigator.clipboard.writeText(out.publicUrl)}catch(e){}}
+    if(tok)$("b-session").className="";},
     function(e){$("b-finish").disabled=false;msg("v-err",e.message+(e.next?" — "+e.next:""))})};
+// 8. one-time session backup (doc §7.4): token required, shown exactly once
+$("b-session").onclick=function(){
+  fetch(base+"session",{headers:{"x-setup-token":tok||""}})
+    .then(function(r){return r.json().then(function(j){return{r:r,j:j}},function(){return{r:r,j:null}})})
+    .then(function(o){var j=o.j||{};
+      if(o.r.ok&&j.ok){$("d-session").textContent=j.session;$("d-session").className="";$("b-session").className="hidden";
+        msg("d-err","Copy it now — it is never shown again.")}
+      else{$("b-session").className="hidden";msg("d-err",j.message||("HTTP "+o.r.status))}})};
 </script>
 <noscript>This page needs JavaScript.</noscript></body></html>`;
 }

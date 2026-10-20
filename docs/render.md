@@ -116,7 +116,9 @@ options) are safe — the wizard rewrites `cfg:v1`.
   makes cold starts warm, and the encrypted `cfg:v1` in the Key Value
   store is why a re-deploy alone never loses the wizard's work. If the
   free Key Value plan ever wipes it, setup re-opens cleanly — run the
-  wizard again (or upgrade the plan).
+  wizard again (or upgrade the plan). The done screen can reveal the
+  finished session string once (`Reveal session backup`, deploy-log token
+  required) so you can boot from `TELEGRAM_SESSION_STRING` instead.
 - **Second account / second deployment:** Telegram authorizes one live
   session per account; the cheap warm standby is a *second Telegram
   account (own session, own Blueprint, own Key Value)*. Two Render
@@ -142,8 +144,11 @@ options) are safe — the wizard rewrites `cfg:v1`.
   credential that can read every chat it can see. Never reuse a personal
   account (§8).
 - The session string lives only encrypted in `cfg:v1`; it never appears
-  in logs. If you export it (e.g. for the M5 env path), keep it out of
-  tickets, screenshots and repo files.
+  in logs. If you export it (e.g. for the M5 env path or the done-screen
+  backup reveal), keep it out of tickets, screenshots and repo files.
+- The done screen reveals the finished session string exactly once
+  (deploy-log token required, doc §7.4) as a durable backup; whether
+  revealed or not, it is dropped from memory with the wizard state.
 - The setup token is per-boot and unguessable, the cookie is
   `HttpOnly SameSite=Strict`, and every `/setup/*` route dies after
   finish — do not widen these.

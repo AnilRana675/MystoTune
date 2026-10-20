@@ -442,6 +442,7 @@ type StatusPayload = {
   options: { allowDownloads: boolean; monthlyBytesBudget: number };
   verify: { rows: Array<{ id: string; ok: boolean; severity: string; detail: string }>; finishAllowed: boolean } | null;
   publicUrl: string | null;
+  backupReady: boolean;
 };
 
 async function statusOf(ts: TestServer): Promise<StatusPayload> {
@@ -827,6 +828,27 @@ test("setup wizard end to end: login, channels, failing then passing verify, fin
     assert.equal(sAfter.publicUrl, `${ts.baseUrl}/${TEST_SECRET}`);
     assert.equal(sAfter.user, null);
     assert.ok(logins.every((l) => l.closeCount >= 1), "every discarded login was closed");
+
+    // session backup (doc §7.4): the deploy-log token reveals it once
+    assert.equal((await statusOf(ts)).backupReady, true);
+    const backupA = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/session`, {
+      headers: { "x-setup-token": ts.setupAccess!.token },
+    });
+    assert.equal(backupA.status, 200);
+    const backupBody = (await backupA.json()) as { ok: boolean; session: string };
+    assert.equal(backupBody.ok, true);
+    assert.equal(backupBody.session, "SESSION_STRING_TEST");
+    assert.equal((await statusOf(ts)).backupReady, false, "the string never shows twice");
+    const backupAgain = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/session`, {
+      headers: { "x-setup-token": ts.setupAccess!.token },
+    });
+    assert.equal(backupAgain.status, 404, "second reveal is gone");
+    const backupBad = await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/session`, {
+      headers: { "x-setup-token": "nope" },
+    });
+    assert.equal(backupBad.status, 403, "a wrong link cannot brute-force the backup");
+    await backupBad.json(); // drain the body
+    assert.equal((await fetch(`${ts.baseUrl}/${TEST_SECRET}/setup/api/session`)).status, 403, "no header → forbidden");
   } finally {
     await ts.cleanup();
   }

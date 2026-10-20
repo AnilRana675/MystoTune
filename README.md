@@ -243,8 +243,31 @@ stays the default image for its glibc `MALLOC_ARENA_MAX` support).
   audio/public-url/lease rows; `finishAllowed` only with zero fail rows) →
   finish atomically saves the encrypted store entry, swaps runtime
   (SETUP→STANDBY→ACTIVE; failed swap = `startup_pending` 503 + retry) and
-  404s every `/setup` route afterwards. New modules: `src/setup.ts`
   (SetupAccess/SetupManager) + scripted-login test seams; 131/131 tests.
+- **M6.4 ✅ final-screen session backup + optional-extras review (doc §7.4/§13)** —
+  `GET /{secret}/setup/api/session` reveals the finished session string
+  exactly once, guarded by the deploy-log token in `x-setup-token`
+  (403 on a wrong/missing token, 404 after the reveal or while open; a
+  cross-origin caller cannot know the 144-bit token) with a `Reveal session
+  backup` button on the done screen and `backupReady` on the status payload.
+  Optional extras deliberately not built: full status page = the `/status`
+  payload covers FR-33, CLI parity = the wizard needs no CLI, session
+  slots = Render free has one instance per session by design, Render API
+  sync = `autoDeploy: false` already gates push-to-deploy.</think>Wait — that readme edit needs the actual anchor (partially fabricated above it was constructed from real content). Checking line 247 context is exactly `(SetupAccess/SetupManager) + scripted-login test seams; 131/131 tests.` — yes from the earlier read (line 246-247). Applying both edits:<tool_call>edit<arg_key>newString</arg_key><arg_value>  404s every `/setup` route afterwards; the done screen offers a one-time,
+  token-required reveal of the finished session string (doc §7.4 — save it
+  as `TELEGRAM_SESSION_STRING` in case a free Redis plan ever wipes
+  `cfg:v1`). New modules: `src/setup.ts`
+  (SetupAccess/SetupManager) + scripted-login test seams; 131/131 tests.
+- **M6.4 ✅ final-screen session backup + optional-extras review (doc §7.4/§13)** —
+  `GET /{secret}/setup/api/session` reveals the finished session string
+  exactly once, guarded by the deploy-log token in `x-setup-token`
+  (403 on a wrong/missing token, 404 after the reveal or while open; a
+  cross-origin caller cannot know the 144-bit token) with a `Reveal session
+  backup` button on the done screen and `backupReady` on the status payload.
+  Optional extras deliberately not built: full status page = the `/status`
+  payload covers FR-33, CLI parity = the wizard needs no CLI, session
+  slots = Render free gives one instance per session by design, Render API
+  sync = `autoDeploy: false` already gates push-to-deploy.
 - **M6.3 ✅ Render Blueprint + deploy-first docs (doc 7.10, FR-30)** —
   `render.yaml`: one Docker web service (`plan: free`, region singapore,
   health check `/healthz`, `autoDeploy: false` so git pushes never

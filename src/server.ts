@@ -875,6 +875,22 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     return jsonify(reply, { ok: true, ...out });
   });
 
+  // Session backup (doc §7.4): the deploy-log token reveals the finished
+  // session string once, guarding against a free Redis plan losing the
+  // config. Token arrives in the x-setup-token header — the #t fragment
+  // never travels server-side, so the page rebuilds it from the link it
+  // opened. No CSRF: a cross-origin caller cannot know the 144-bit token.
+  app.get("/:secret/setup/api/session", (req, reply) => {
+    if (!secretOk((req.params as { secret?: string }).secret) || !setupMgr || !setupAccess) {
+      return reply.code(404).send({});
+    }
+    if (!setupMgr.closed) return reply.code(404).send({});
+    if (!setupAccess.tokenOk((req.headers["x-setup-token"] as unknown) ?? null)) {
+      return jsonify(reply, { ok: false, code: "forbidden", message: "Use the link from the deploy logs — it carries the token" }, 403);
+    }
+    return jsonify(reply, { ok: true, ...setupMgr.revealBackup() });
+  });
+
   // Minimal status page (FR-33 starter; full json lands in M6.4). Stays up
   // after the wizard closes so the owner can confirm the addon went live.
   app.get("/:secret/status", (req, reply) => {
