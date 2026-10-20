@@ -19,8 +19,12 @@ Two deliberate settings:
 - **`autoDeploy: false`** — a git push must not redeploy: deploys briefly
   run a second instance, and the session lease (below) owns that overlap.
   Use *Deploy latest commit*.
-- **`maxShutdownDelaySeconds: 30`** — the drain waits up to 10 s for
-  active streams after SIGTERM; 30 s keeps the shutdown graceful.
+- **Shutdown grace** — NOT set: `maxShutdownDelaySeconds` is rejected at
+  deploy time for free-tier services. The platform's default grace applies;
+  the drain (doc §7.11) still tries to finish active streams ≤ 10 s, and if
+  the instance is force-killed sooner the lease simply expires via its 45 s
+  TTL while `/healthz` keeps the old instance serving until the new one
+  passes. On a paid plan re-add `maxShutdownDelaySeconds: 30`.
 
 ## First deploy (M6 setup wizard)
 

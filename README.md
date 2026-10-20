@@ -279,8 +279,9 @@ stays the default image for its glibc `MALLOC_ARENA_MAX` support).
 - **M6.3 ✅ Render Blueprint + deploy-first docs (doc 7.10, FR-30)** —
   `render.yaml`: one Docker web service (`plan: free`, region singapore,
   health check `/healthz`, `autoDeploy: false` so git pushes never
-  redeploy into your session, `maxShutdownDelaySeconds: 30` covers the
-  10 s drain) + one free Key Value store (`ipAllowList: []`,
+  redeploy into your session; `maxShutdownDelaySeconds` omitted — free
+  tier rejects it, the platform's default grace applies) + one free Key
+  Value store (`ipAllowList: []`,
   `maxmemoryPolicy: noeviction` protects `cfg:v1`); `APP_SEED` via
   `generateValue` and `REDIS_URL` wired with `fromService` connectionString;
   **no** Telegram/env secrets in the file — the wizard owns them.

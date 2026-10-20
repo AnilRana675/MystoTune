@@ -22,8 +22,9 @@ services:
     healthCheckPath: /healthz
     autoDeploy: false
     # The drain (doc §7.11) waits up to 10 s for active streams after
-    # SIGTERM; give the process room so wipes are graceful, not severed.
-    maxShutdownDelaySeconds: 30
+    # SIGTERM. Free-tier services do NOT support maxShutdownDelaySeconds
+    # (Render rejects it at deploy time); the platform's default grace
+    # applies. On a paid plan, re-add `maxShutdownDelaySeconds: 30` here.
     envVars:
       - key: APP_SEED
         generateValue: true
