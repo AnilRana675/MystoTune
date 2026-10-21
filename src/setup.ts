@@ -905,7 +905,7 @@ $("b-channels").onclick=function(){var ids=[];
   setk("options")};
 // 5. options → 6. verify (server runs the doc 7.8 checks)
 $("b-options").onclick=function(){msg("o-err");
-  rq("options",{allowDownloads:$("o-dl").checked,monthlyBytesBudget:Number($("o-budget").value)||4500000000,channels:selectedIds()})
+  rq("options",{allowDownloads:$("o-dl").checked,monthlyBytesBudget:Number($("o-budget").value)||0,channels:selectedIds()})
     .then(function(){setk("verify")},function(e){msg("o-err",e.message+(e.next?" — "+e.next:""))})};
 function selectedIds(){return channels.map(function(c){return c.id}).length&&Array.from(document.querySelectorAll("#ch-list input[type=checkbox]:checked")).map(function(cb){return Number(cb.value)})}
 $("b-verify").onclick=function(){msg("v-err");$("b-verify").disabled=true;

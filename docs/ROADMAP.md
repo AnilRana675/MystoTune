@@ -211,7 +211,10 @@ iberately not built: full status page = the `/status`
   touching logs; boots with no store and no channels now warn loudly.
 - **M7.4 ✅ docs + release prep** — grammar examples in the README quick
   start; this ledger carries M7; version 0.7.0-discovery released on the
-  automation when merged to main.
+  automation when merged to main. Follow-up on the same milestone: the
+  monthly egress budget now defaults to unlimited (`MONTHLY_BYTES_BUDGET=0`
+  opt-in cap; also fixed the wizard options screen coercing a typed 0 back
+  into the old 4.5 GB default).
 
 ## Open drills (manual acceptance on Render)
 

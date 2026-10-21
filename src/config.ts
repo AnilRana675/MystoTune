@@ -56,7 +56,8 @@ export interface AppConfig {
   admissionWaitMs: number;
   allowDownloads: boolean;
   checkValidLossless: boolean;
-  /** §4.15 Render profile: monthly egress budget in bytes (0 disables). */
+  /** §4.15 Render profile: monthly egress budget in bytes. Default is 0 =
+   * unlimited; set MONTHLY_BYTES_BUDGET to opt into a soft cap (404-fallback). */
   monthlyBytesBudget: number;
   /** §4.15 deploy overlap: boot-time retries for AUTH_KEY_DUPLICATED. */
   bootAuthRetries: number;
@@ -258,7 +259,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     admissionWaitMs: intEnv(env, "ADMISSION_WAIT_MS", 2000, 100, 60_000),
     allowDownloads: boolEnv(env, "ALLOW_DOWNLOADS", true),
     checkValidLossless: boolEnv(env, "CHECK_VALID_LOSSLESS", false),
-    monthlyBytesBudget: intEnv(env, "MONTHLY_BYTES_BUDGET", 4_500_000_000, 0, 1_000_000_000_000),
+    monthlyBytesBudget: intEnv(env, "MONTHLY_BYTES_BUDGET", 0, 0, 1_000_000_000_000),
     bootAuthRetries: intEnv(env, "BOOT_AUTH_RETRIES", 3, 1, 10),
     bootAuthRetryWaitSeconds: intEnv(env, "BOOT_AUTH_RETRY_WAIT_SECONDS", 60, 0, 3_600),
     setupEnabled: parseSetupEnabled(env),
