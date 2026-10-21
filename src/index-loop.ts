@@ -39,7 +39,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 /** Real-stream guarantee (§4.11): the very first redis command of a boot must
  * not race the TLS handshake — wait (bounded) until the store reports up. */
-async function waitRedisUp(redis: RedisStore, deadlineMs = 2_500): Promise<void> {
+export async function waitRedisUp(redis: RedisStore, deadlineMs = 2_500): Promise<void> {
   const until = Date.now() + deadlineMs;
   while (Date.now() < until) {
     if (redis.status() === "up") return;

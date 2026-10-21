@@ -38,7 +38,7 @@ import { createArtToken, createMediaToken, etagFor, verifyArtToken, verifyMediaT
 import { Lru, TelegramManager, TelegramSourceError, type ArtSource } from "./telegram";
 import { audioDescriptor, audioQuality, cleanName, formatOf, parseTrackId, qualityLabel } from "./indexer";
 import { probeFirstBytes } from "./probe";
-import { IndexIndexer, restoreSnapshotIfEmpty } from "./index-loop";
+import { IndexIndexer, restoreSnapshotIfEmpty, waitRedisUp } from "./index-loop";
 import { openRedisStore, type RedisStore } from "./redis";
 import { renderSetupPage, SetupAccess, SetupError, SetupManager, type LoginFactory, type SetupChannel, type SetupDeps, type SetupLogin } from "./setup";
 import bigInt from "big-integer"; // gramJS BigInteger for the setup login adapter
@@ -1172,6 +1172,10 @@ export async function main(): Promise<void> {
   // store fills only what explicit env left unset; a tampered/unreadable
   // store (e.g. rotated APP_SEED) simply falls back to env-only boot.
   const configStore = new ConfigStore({ key: cfg.configKey, redis, filePath: DEFAULT_CONFIG_FILE });
+  // M6.13: this read is the first Redis round-trip of a boot. Hold it until
+  // the handshake is up (bounded) — ioredis rejects instantly otherwise
+  // ("Stream isn't writeable") and wizard-configured boots lose the store.
+  if (redis) await waitRedisUp(redis);
   const storedRecord = await configStore.load().catch(() => null);
   cfg = applyStoredConfig(cfg, storedRecord);
 
