@@ -1,6 +1,6 @@
 # MystoTune — BitChord Telegram Addon
 
-A [BitChord](https://bitchord.music) addon server that indexes music shared in your own
+A [BitChord](https://github.com/kushagrasinghx/BitChord) addon server that indexes music shared in your own
 Telegram channels and streams it back with signed URLs, random access and byte-exact
 seeking. Spec source of truth: `docs/BitChord Telegram Addon PRD & TRD (v2).md`.
 
