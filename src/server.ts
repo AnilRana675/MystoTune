@@ -310,7 +310,8 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     // deleted rows simply drop out until the next miss refreshes the cache.
     let rows: TrackRow[] | null = null;
     if (redisStore) {
-      const hash = redisStore.queryHash(q);
+      /* M7: the grammar changed results — salt the cache key so pre-v0.7 ids expire */
+      const hash = redisStore.queryHash(`v2:${q}`);
       const ids = await redisStore.getQueryIds(hash);
       if (ids) {
         rows = ids

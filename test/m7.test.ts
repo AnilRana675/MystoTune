@@ -187,3 +187,103 @@ test("query: lexer table", () => {
     assert.deepEqual(row.check(q), row.want, `lexer: ${row.name}`);
   }
 });
+
+/* ===================== M7.1-M7.2 grammar bindings ===================== */
+
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createSchema, openDb, searchTracks, upsertTrack, type TrackRow } from "../src/db.js";
+
+/* /tmp is read-only in some dev sandboxes; /tmp/opencode is the approved base */
+const tmpBase = existsSync("/tmp/opencode") ? "/tmp/opencode" : os.tmpdir();
+
+function titleOf(rows: TrackRow[]): string[] {
+  return rows.map((r) => r.title);
+}
+
+const mk = (
+  n: number,
+  title: string,
+  artist: string,
+  album: string | null,
+  duration: number,
+  lossless: 0 | 1,
+  mime: string,
+  container: string,
+  ageDays: number,
+): Parameters<typeof upsertTrack>[1] => ({
+  id: `tg_-7001_${11 + n}`,
+  chatId: -7001,
+  msgId: 11 + n,
+  title,
+  artist,
+  album,
+  duration,
+  mime,
+  size: lossless ? 9000 : 3000,
+  fileName: `${title.toLowerCase().replace(/\s+/g, "-")}.${container}`,
+  codec: null,
+  container,
+  lossless,
+  bitrateKbps: null,
+  docId: 11 + n,
+  source: "telegram",
+  filePath: null,
+  hasThumb: 0,
+  addedAt: Date.now() - ageDays * 86_400_000,
+});
+
+test("search: typed grammar filters, phrases, scoped fields, explicit sorts", () => {
+  const dir = mkdtempSync(path.join(tmpBase, "m7-grammar-"));
+  const db = openDb(path.join(dir, "g.sqlite"));
+  try {
+    createSchema(db);
+    upsertTrack(db, mk(0, "Midnight City", "M83", "Hurry", 244, 0, "audio/mpeg", "mp3", 100));
+    upsertTrack(db, mk(1, "Midnight City", "M83", "Hurry", 243, 1, "audio/flac", "flac", 50));
+    upsertTrack(db, mk(2, "Skinny Love", "Birdy", null, 180, 0, "audio/mpeg", "mp3", 10));
+    upsertTrack(db, mk(3, "Day Glow", "Aesop Rock", "Skelethon", 320, 1, "audio/flac", "flac", 0.04));
+    upsertTrack(db, mk(4, "Lossless", "X", null, 100, 0, "audio/mpeg", "mp3", 2));
+
+    /* legacy parity: plain text behaves exactly like pre-M7 (dedupe keeps lossless) */
+    assert.deepEqual(titleOf(searchTracks(db, "midnight")), ["Midnight City"]);
+    assert.equal(searchTracks(db, "midnight")[0]?.mime, "audio/flac");
+
+    /* scoped fields */
+    assert.deepEqual(titleOf(searchTracks(db, "artist:m83")), ["Midnight City"]);
+    assert.deepEqual(titleOf(searchTracks(db, "album:hurry")), ["Midnight City"]);
+    assert.deepEqual(titleOf(searchTracks(db, "title:'Day Glow'")), ["Day Glow"]);
+
+    /* quoted phrases: adjacency, order matters */
+    assert.deepEqual(titleOf(searchTracks(db, '"skinny love"')), ["Skinny Love"]);
+    assert.deepEqual(titleOf(searchTracks(db, '"love skinny"')), []);
+
+    /* filters: bare lossless excludes the track merely TITLED lossless */
+    assert.deepEqual(titleOf(searchTracks(db, "lossless midnight")), ["Midnight City"]);
+    assert.deepEqual(titleOf(searchTracks(db, "lossless X")), []);
+    assert.deepEqual(titleOf(searchTracks(db, "dur:>=300")), ["Day Glow"]);
+    assert.deepEqual(titleOf(searchTracks(db, "dur:<200")), ["Skinny Love", "Lossless"]);
+    assert.deepEqual(titleOf(searchTracks(db, "dur:180")), ["Skinny Love"]);
+    assert.deepEqual(
+      [...titleOf(searchTracks(db, "recent:3"))].sort(),
+      ["Day Glow", "Lossless"],
+    );
+
+    /* explicit sorts over the full-scan pool */
+    assert.deepEqual(titleOf(searchTracks(db, "lossless sort:oldest")), ["Midnight City", "Day Glow"]);
+    assert.deepEqual(titleOf(searchTracks(db, "lossless sort:recent")), ["Day Glow", "Midnight City"]);
+    assert.deepEqual(titleOf(searchTracks(db, "sort:longest")), [
+      "Day Glow",
+      "Midnight City",
+      "Skinny Love",
+      "Lossless",
+    ]);
+
+    /* mixed grammar across slots */
+    assert.deepEqual(titleOf(searchTracks(db, "artist:birdy dur:<200")), ["Skinny Love"]);
+    assert.deepEqual(titleOf(searchTracks(db, "midnight artist:m83")), ["Midnight City"]);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
