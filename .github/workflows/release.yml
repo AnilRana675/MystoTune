@@ -3,8 +3,8 @@ name: release
 # Release automation (repo ops): every push to main installs, typechecks, and
 # test-gates; a push that bumps the version in package.json to one without a
 # v<version> tag gets that tag + a GitHub Release whose notes are composed by
-# scripts/release-notes.mjs (README roadmap highlight + commit list + diff
-# link). An existing release's notes get refreshed on later pushes, so the
+# scripts/release-notes.mjs (docs/ROADMAP.md ledger highlight + commit list
+# + diff link). An existing release's notes get refreshed on later pushes, so the
 # page stays current. Render deploys stay independent (autoDeploy:false).
 
 on:

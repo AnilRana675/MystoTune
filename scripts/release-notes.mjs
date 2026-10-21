@@ -2,8 +2,8 @@
 /**
  * Release notes composer for the GitHub "release" workflow (repo ops).
  *
- * Body = Highlights (the matching README roadmap headline, e.g. the
- * M6.2 ✅ bullet's first line) + Changes (one bullet per commit since the
+ * Body = Highlights (the matching docs/ROADMAP.md ledger headline, e.g.
+ * the M6.2 ✅ bullet's first line) + Changes (one bullet per commit since the
  * previous v* tag) + Full changelog link. Consumed by .github/workflows/
  * release.yml via `--notes-file`; local use is fine too:
  *
@@ -29,7 +29,7 @@ const parts = [];
 const m = /^(\d+)\.(\d+)\.(\d+)\b/.exec(version);
 if (m) {
   try {
-    const md = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+    const md = readFileSync(new URL("../docs/ROADMAP.md", import.meta.url), "utf8");
     const key = `**M${m[2]}.${m[3]} ✅`;
     const start = md.indexOf(key);
     if (start >= 0) {
@@ -39,7 +39,7 @@ if (m) {
       if (headline) parts.push(`## Highlights\n\n- ${headline}\n`);
     }
   } catch {
-    /* README unavailable — skip */
+    /* ledger unavailable — skip */
   }
 }
 
