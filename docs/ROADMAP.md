@@ -183,6 +183,35 @@ iberately not built: full status page = the `/status`
   which is what made the failure visible in the first place. Docs: README
   slimmed to hero / quick start / tests; this ledger became the release
   Highlights source (`scripts/release-notes.mjs` reads it now).
+- **M7.0 ✅ typed-search grammar lexer (src/query.ts)** — a single
+  `parseQuery()` that reads a BitChord search box without breaking plain
+  queries: quoted spans become phrases, `artist:/album:/title:` scope
+  tokens, `dur:` windows, `recent:` day windows, `sort:` explicit orders and
+  a bare `lossless` flag — case-insensitive, junk-tolerant, unbalanced-quote
+  safe, and unknown prefixes degrade to free text exactly like v0.6. Table
+  driven lexer tests (23 rows) plus plain/empty framing tests.
+- **M7.1 ✅ typed search binding (dual-path engine)** — plain queries run the
+  untouched legacy pipeline byte-for-byte (same FTS match, same boosts, same
+  dedupe); structured queries parse once and bind: FTS5 column filters
+  (`artist : m83*`, exact adjacency for like `title : "day glow"`), real
+  phrase adjacency (order matters), `lossless`, `dur:>=<=<>=` windows,
+  `recent:Nd` windows, OR-fallback under 5 rows, and +4/+3 title/artist
+  boosts with the same near-dup dedupe (±2 s, keep lossless) shared by both
+  paths. The Redis query cache is salted `v2:` so pre-grammar cached ids
+  expire harmlessly.
+- **M7.2 ✅ explicit sorts** — `sort:recent|oldest|longest|relevance`
+  (relevance stays default and byte-identical; the other three use dedicated
+  ORDER BY pools — addedAt desc/asc, duration — with pool-order preserved
+  through the shared dedupe). Longest on the fixture pool returns exact
+  title order: Day Glow → Midnight City → Skinny Love → Lossless.
+- **M7.3 ✅ ops-hygiene (live-ops visibility)** — `/healthz` grows
+  `channels: N`, `lastSyncError` (message or null, already tracked by the
+  indexer per sync pass) and `lastSearches` (the last 10 raw queries,
+  memory-only ring) — day-one field verification of the grammar without
+  touching logs; boots with no store and no channels now warn loudly.
+- **M7.4 ✅ docs + release prep** — grammar examples in the README quick
+  start; this ledger carries M7; version 0.7.0-discovery released on the
+  automation when merged to main.
 
 ## Open drills (manual acceptance on Render)
 

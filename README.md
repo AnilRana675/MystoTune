@@ -46,6 +46,24 @@ Redis session-lease hand-over safe, doc §7.11), redeploys overlap for ≤15 s
 without killing your Telegram session, and a failed login re-opens setup
 with a banner. Details in `docs/render.md`.
 
+### Search grammar (what you can type in BitChord)
+
+Plain words work exactly as before — the grammar is opt-in:
+
+- `artist:m83` / `album:hurry` / `title:'day glow'` — field scoping
+  (single word = prefix match; quotes = exact phrase in that field);
+- `"midnight city"` — quoted phrase, word order matters;
+- `lossless` — only lossless results (FLAC/ALAC);
+- `dur:>=300` `dur:<180` `dur:180` — duration windows in seconds;
+- `recent:7d` — only tracks added in the last 7 days (up to 3650d);
+- `sort:recent` / `sort:oldest` / `sort:longest` / `sort:relevance` —
+  explicit ordering (default `relevance`, unchanged from v0.6).
+
+Combine freely: `artist:m83 lossless`, `title:'skinny love' dur:<200`,
+`recent:2 sort:recent`. Unknown prefixes degrade back to plain text.
+The last 10 queries show up in `/healthz` as `lastSearches` — handy to
+confirm what BitChord actually sent.
+
 ## Local development
 
 ```bash
