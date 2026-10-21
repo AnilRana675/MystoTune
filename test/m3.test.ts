@@ -290,8 +290,8 @@ test("with Redis stopped, search and playback keep working", async () => {
     const head = await fetch(streamUrl, { method: "HEAD" });
     assert.equal(head.status, 200);
 
-    // healthz reports the down store (§4.12 cache visibility)
-    const health = (await (await fetchJson(ts, "/healthz")).json()) as {
+    // status reports the down store (§4.12 cache visibility; M7.5 secret-gated)
+    const health = (await (await fetchJson(ts, `/${TEST_SECRET}/status`)).json()) as {
       cache: { redis: string };
     };
     assert.equal(health.cache.redis, "down");

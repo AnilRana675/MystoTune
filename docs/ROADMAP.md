@@ -222,3 +222,12 @@ iberately not built: full status page = the `/status`
 - [ ] Play one MP3 and one FLAC from the deployed instance
 - [ ] Five consecutive redeploys without `AUTH_KEY_DUPLICATED` (the lease
       code + fake-Redis tests cover the mechanism; the drill is manual)
+- **M7.5 ✅ health privacy split (v0.7.0-discovery follow-up)** — `/healthz` is
+  unauthenticated by contract (Render checks, pingers), so the M7.3 additions
+  were a leak: anyone with the URL could read the `lastSearches` ring (raw
+  query history), channel counts, budgets, and Redis stats. `/healthz` now
+  returns only `ok` + `mode`; the full ops payload (memory, admissions, budget,
+  index, sync health, lastSearches, counters) moved behind `/{secret}/status`,
+  which keeps the M6.2 wizard payload while the setup site is open and rides
+  the wizard closure fields (`closed`/`publicUrl`) on top of the ops payload
+  after finish — both contracts on one secret route.

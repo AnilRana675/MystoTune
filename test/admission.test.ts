@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createMediaToken } from "../src/sign.js";
 import { Admissions, AdmissionTimeoutError } from "../src/media.js";
-import { buildTestServer, type TestServer } from "./util.js";
+import { buildTestServer, TEST_SECRET, type TestServer } from "./util.js";
 
 let ts: TestServer;
 test.before(async () => {
@@ -20,7 +20,7 @@ const urlFor = (i: number): string => {
 };
 
 const health = async (): Promise<{ activeStreams: number }> => {
-  const h = await (await fetch(`${ts.baseUrl}/healthz`)).json();
+  const h = await (await fetch(`${ts.baseUrl}/${TEST_SECRET}/status`)).json();
   return h as { activeStreams: number };
 };
 

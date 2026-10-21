@@ -708,9 +708,10 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
 
   /* -------------------------------------------------------------- healthz */
 
-  app.get("/healthz", (_req, reply) => {
+  /** M7.5 privacy split: the former healthz body, now secret-gated below. */
+  const opsStatus = () => {
     const mem = process.memoryUsage();
-    return jsonify(reply, {
+    return {
       ok: runtime.telegram.state !== "fatal",
       mode: modeBox.mode, // M6.1 (doc 7.2): setup | standby | active | draining | failed
       uptimeSec: Math.round((Date.now() - metrics.since) / 1000),
@@ -747,6 +748,17 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
         floodWaits: metrics.floodWaits,
         telegram503: metrics.telegram503,
       },
+    };
+  };
+
+  app.get("/healthz", (_req, reply) => {
+    // M7.5 privacy split: /healthz is unauthenticated by contract (Render
+    // checks, pingers) and must leak nothing — not search history, not
+    // topology, not budgets. Minimal shape: ok + mode only. The full ops
+    // payload lives at /{secret}/status.
+    return jsonify(reply, {
+      ok: runtime.telegram.state !== "fatal",
+      mode: modeBox.mode, // setup | standby | active | draining | failed
     });
   });
 
@@ -906,7 +918,15 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
   app.get("/:secret/status", (req, reply) => {
     const deny = secretOnly(req, reply);
     if (deny) return deny;
-    return jsonify(reply, setupMgr ? setupMgr.getStatus() : { closed: true, reason: "not built" });
+    /* M6.2 wizard contract while the setup site is open: the pure wizard
+       status. After closure (M6.2: status keeps answering closed:true +
+       publicUrl) the wizard fields ride on top of the M7.5 ops payload —
+       wizard-built deployments keep both contracts on one secret route. */
+    if (setupMgr && modeBox.mode === "setup" && !setupMgr.closed) {
+      return jsonify(reply, setupMgr.getStatus());
+    }
+    if (setupMgr) return jsonify(reply, { ...opsStatus(), ...setupMgr.getStatus() });
+    return jsonify(reply, opsStatus());
   });
 
   /* expose internals for tests/soak */
