@@ -74,7 +74,8 @@ jobs:
           cat "$RUNNER_TEMP/notes.md"
           if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null 2>&1; then
             # tag already out — refresh its notes (keeps the page current)
-            gh release edit "v$VERSION" --notes-file "$RUNNER_TEMP/notes.md" || true
+            gh release edit "v$VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
+              --title "MystoTune v$VERSION" || true
           else
             git config user.name "mystotune-release-bot"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -82,5 +83,5 @@ jobs:
             git push origin "v$VERSION"
             gh release create "v$VERSION" \
               --notes-file "$RUNNER_TEMP/notes.md" \
-              --title "BitChord Telegram Addon v$VERSION"
+              --title "MystoTune v$VERSION"
           fi
