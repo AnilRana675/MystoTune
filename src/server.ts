@@ -50,6 +50,7 @@ const RANGE_PROBE_LIMIT = 4096; // HEAD and <=4 KiB range probes are free (FR-19
 export interface Metrics {
   since: number;
   searches: number;
+  recentSearches: string[];
   streamResolves: number;
   stream404: number;
   mediaStreams: number;
@@ -64,6 +65,7 @@ export function createMetrics(): Metrics {
   return {
     since: Date.now(),
     searches: 0,
+    recentSearches: [],
     streamResolves: 0,
     stream404: 0,
     mediaStreams: 0,
@@ -299,6 +301,9 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     void query.atmos; // FR-10: accept & ignore (stereo)
     const q = (query.q ?? "").slice(0, 300);
     metrics.searches += 1;
+    /* M7.3: last-searches probe (memory-only ring, healthz visibility) */
+    metrics.recentSearches.push(q);
+    if (metrics.recentSearches.length > 10) metrics.recentSearches.shift();
 
     // M6.1 (doc 7.2): SETUP serves a valid but empty index — the wizard runs
     // while the addon is already discoverable by BitChord.
@@ -721,6 +726,10 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
       indexCount: countTracks(db),
       indexing: Boolean(runtime.indexer?.active),
       lastSyncAt: runtime.indexer?.lastSyncAt ?? 0,
+      // M7.3: sync health at a glance
+      channels: cfg.telegram.channels.length,
+      lastSyncError: runtime.indexer?.lastSyncError || null,
+      lastSearches: metrics.recentSearches,
       telegram: runtime.telegram.state,
       telegramDetail: runtime.telegram.detail,
       cache: {
@@ -1179,6 +1188,14 @@ export async function main(): Promise<void> {
   if (redis) await waitRedisUp(redis);
   const storedRecord = await configStore.load().catch(() => null);
   cfg = applyStoredConfig(cfg, storedRecord);
+  // M7.3: the zero-index mystery boots all shared one signature — warn at boot,
+  // at the source, instead of letting a channel-less addon idle silently.
+  if (!storedRecord && cfg.telegram.channels.length === 0) {
+    console.warn(
+      "boot: no Telegram channels configured (env TARGET_CHANNEL_IDS empty and no " +
+        "saved store) — the index will stay empty until the wizard or env provides one",
+    );
+  }
 
   const telegram = new TelegramManager(cfg, redis);
   const indexer = new IndexIndexer(db, telegram, cfg, undefined, redis);
