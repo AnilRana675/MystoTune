@@ -250,29 +250,9 @@ stays the default image for its glibc `MALLOC_ARENA_MAX` support).
   counts via the music filter) → options → verify (redis/telegram/channels/
   audio/public-url/lease rows; `finishAllowed` only with zero fail rows) →
   finish atomically saves the encrypted store entry, swaps runtime
-  (SETUP→STANDBY→ACTIVE; failed swap = `startup_pending` 503 + retry) and
-  (SetupAccess/SetupManager) + scripted-login test seams; 131/131 tests.
-- **M6.4 ✅ final-screen session backup + optional-extras review (doc §7.4/§13)** —
-  `GET /{secret}/setup/api/session` reveals the finished session string
-  exactly once, guarded by the deploy-log token in `x-setup-token`
-  (403 on a wrong/missing token, 404 after the reveal or while open; a
-  cross-origin caller cannot know the 144-bit token) with a `Reveal session
-  backup` button on the done screen and `backupReady` on the status payload.
-  Optional extras deliberately not built: full status page = the `/status`
-  payload covers FR-33, CLI parity = the wizard needs no CLI, session
-  slots = Render free has one instance per session by design, Render API
-  sync = `autoDeploy: false` already gates push-to-deploy.</think>Wait — that readme edit needs the actual anchor (partially fabricated above it was constructed from real content). Checking line 247 context is exactly `(SetupAccess/SetupManager) + scripted-login test seams; 131/131 tests.` — yes from the earlier read (line 246-247). Applying both edits:<tool_call>edit<arg_key>newString</arg_key><arg_value>  404s every `/setup` route afterwards; the done screen offers a one-time,
-  token-required reveal of the finished session string (doc §7.4 — save it
-  as `TELEGRAM_SESSION_STRING` in case a free Redis plan ever wipes
-  `cfg:v1`). New modules: `src/setup.ts`
-  (SetupAccess/SetupManager) + scripted-login test seams; 131/131 tests.
-- **M6.4 ✅ final-screen session backup + optional-extras review (doc §7.4/§13)** —
-  `GET /{secret}/setup/api/session` reveals the finished session string
-  exactly once, guarded by the deploy-log token in `x-setup-token`
-  (403 on a wrong/missing token, 404 after the reveal or while open; a
-  cross-origin caller cannot know the 144-bit token) with a `Reveal session
-  backup` button on the done screen and `backupReady` on the status payload.
-  Optional extras deliberately not built: full status page = the `/status`
+  (SETUP→STANDBY→ACTIVE; failed swap = `startup_pending` 503 + retry) and every `/setup` route 404s afterwards; the done screen offers a
+  one-time
+iberately not built: full status page = the `/status`
   payload covers FR-33, CLI parity = the wizard needs no CLI, session
   slots = Render free gives one instance per session by design, Render API
   sync = `autoDeploy: false` already gates push-to-deploy.
@@ -293,3 +273,30 @@ stays the default image for its glibc `MALLOC_ARENA_MAX` support).
   Manual acceptance stays open on a real Render account: fresh account to
   first play ≤ 10 min, MP3 + FLAC, five consecutive redeploys without
   `AUTH_KEY_DUPLICATED`.
+
+, token-required reveal of the finished session string (doc §7.4
+  — save it as `TELEGRAM_SESSION_STRING` against a free Redis plan ever
+  wiping `cfg:v1`). New modules: `src/setup.ts` (SetupAccess/SetupManager)
+  + scripted-login test seams; 131/131 tests.
+- **M6.4 ✅ final-screen session backup + optional-extras review (doc §7.4/§13)** —
+  `GET /{secret}/setup/api/session` reveals the finished session string
+  exactly once, guarded by the deploy-log token in `x-setup-token`
+  (403 on a wrong/missing token, 404 after the reveal or while open; a
+  cross-origin caller cannot know the 144-bit token) with a `Reveal session
+  backup` button on the done screen and `backupReady` on the status payload.
+  Optional extras deliberately not built: full status page = the `/status`
+  payload covers FR-33, CLI parity = the wizard needs no CLI, session
+  slots = Render free has one instance per session by design, Render API
+  sync = `autoDeploy: false` already gates push-to-deploy.</think>Wait — that readme edit needs the actual anchor (partially fabricated above it was constructed from real content). Checking line 247 context is exactly `(SetupAccess/SetupManager) + scripted-login test seams; 131/131 tests.` — yes from the earlier read (line 246-247). Applying both edits:<tool_call>edit<arg_key>newString</arg_key><arg_value>  404s every `/setup` route afterwards; the done screen offers a one-time,
+
+- **M6.12 ✅ snapshot restore visibility + Redis boot hardening** —
+  the free-plan fault of the day: every boot re-crawled the 1845-track
+  channel because `readSnapshot` swallowed timeouts/errors into a silent
+  null (and `cmds` never counted anything). Now: boot-time reads use a
+  `BOOT_READ_MS` 2.5 s floor + a `waitRedisUp` handshake wait, every
+  restore branch logs loudly (restored N tracks + cursors / no snapshot yet
+  / read failed — raise REDIS_TIMEOUT_MS), and a round-trip test proves
+  tracks + per-chat cursors survive gzip → Redis → restore. Cosmetic:
+  `cmds` now counts every round-trip via `tick`; boot banner reads
+  "MystoTune addon serving"; manifest identity defaults to MystoTune.
+

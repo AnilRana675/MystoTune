@@ -25,6 +25,13 @@ const RATE_TTL_SEC = 60; // rl:{..} — 60 s bucket (§4.11)
 const SNAPSHOT_MAX_BYTES = 24 * 1024 * 1024; // free-tier safe guard
 const FLOOD_KEY = "flood:until";
 const SNAPSHOT_KEY = "index:snapshot";
+/**
+ * Boot-time reads (snapshot + config store) can race the Redis handshake on
+ * slow/free plans; a too-tight REDIS_TIMEOUT_MS then silently wins boot and
+ * the service re-crawls Telegram forever. These reads get a generous floor:
+ * they run once per boot, so latency here never matters on the hot path.
+ */
+const BOOT_READ_MS = 2_500;
 /** §4.15 Render profile: monthly streamed-bytes counter (UTC month TTL). */
 const BYTES_MONTH_KEY = "bytes:month";
 /** M6 config store (doc 7.4): encrypted configuration blob. No TTL — this is
@@ -186,6 +193,11 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
   void client.connect().catch(() => undefined);
 
   const stats: { cmds: number; timeouts: number; errors: number } = { cmds: 0, timeouts: 0, errors: 0 };
+  /** every round-trip is counted so /healthz `cmds` is honest (was a dead 0) */
+  const tick = <T>(p: Promise<T>, ms: number): Promise<T> => {
+    stats.cmds += 1;
+    return withTimeout(p, ms);
+  };
   const local = new LocalRateLimiter();
 
   /* q:{hash} cap registry: FIFO eviction, 500 entries max (§4.11 rule 2) */
@@ -214,7 +226,7 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
         // one round-trip: INCR + EXPIRE together so the bucket always has a TTL
         const pipe = client.pipeline();
         pipe.incr(k).expire(k, RATE_TTL_SEC);
-        const replies = await withTimeout(pipe.exec(), timeoutMs);
+        const replies = await tick(pipe.exec(), timeoutMs);
         if (!replies) throw new CmdTimeoutError("redis pipeline returned no replies");
         const count = replies[0]?.[1];
         if (typeof count !== "number") throw new CmdTimeoutError("redis INCR returned a non-number");
@@ -231,14 +243,14 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
 
     writeFloodUntil(untilSec, waitSec) {
       if (waitSec <= 0) return;
-      void withTimeout(client.set(FLOOD_KEY, String(untilSec), "EX", Math.ceil(waitSec)), timeoutMs).catch(
+      void tick(client.set(FLOOD_KEY, String(untilSec), "EX", Math.ceil(waitSec)), timeoutMs).catch(
         () => undefined,
       );
     },
 
     async readFloodUntil() {
       try {
-        const v = await withTimeout(client.get(FLOOD_KEY), timeoutMs);
+        const v = await tick(client.get(FLOOD_KEY), timeoutMs);
         if (!v) return 0;
         const n = Number(v);
         return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
@@ -251,7 +263,7 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
 
     addBytesMonth(n) {
       if (!Number.isFinite(n) || n <= 0) return;
-      void withTimeout(
+      void tick(
         (async () => {
           const pipe = client.pipeline();
           pipe.incrby(BYTES_MONTH_KEY, Math.floor(n)).expire(BYTES_MONTH_KEY, monthEndTtlSec());
@@ -263,7 +275,7 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
 
     async readBytesMonth() {
       try {
-        const v = await withTimeout(client.get(BYTES_MONTH_KEY), timeoutMs);
+        const v = await tick(client.get(BYTES_MONTH_KEY), timeoutMs);
         const n = Number(v ?? 0);
         return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
       } catch (e) {
@@ -275,24 +287,30 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
 
     async readConfigBlob() {
       try {
-        const v = await withTimeout(client.get(CONFIG_STORE_KEY), timeoutMs);
+        // boot-time read: shelter it from a tight user-tuned timeout
+        const v = await tick(client.get(CONFIG_STORE_KEY), Math.max(timeoutMs, BOOT_READ_MS));
         return v || null;
       } catch (e) {
         if ((e as { code?: string })?.code === "REDIS_CMD_TIMEOUT") stats.timeouts += 1;
         else stats.errors += 1;
+        console.warn(
+          `redis: config store read failed (${(e as { code?: string; message?: string }).message ?? "error"}) — booting env-only`,
+        );
         return null; // caller falls back to the durable file store
       }
     },
 
     writeConfigBlob(blob) {
       if (typeof blob !== "string" || blob.length === 0) return;
-      void withTimeout(client.set(CONFIG_STORE_KEY, blob), timeoutMs).catch(() => undefined);
+      void tick(client.set(CONFIG_STORE_KEY, blob), Math.max(timeoutMs, BOOT_READ_MS)).catch(
+        () => undefined,
+      );
     },
 
     /** M6 lease acquire (doc 7.11): SET NX PX — true only when freshly held. */
     async setIfAbsent(key, value, ttlMs) {
       try {
-        const res = await withTimeout(client.set(key, value, "PX", Math.floor(ttlMs), "NX"), timeoutMs);
+        const res = await tick(client.set(key, value, "PX", Math.floor(ttlMs), "NX"), timeoutMs);
         return res === "OK";
       } catch (e) {
         if ((e as { code?: string })?.code === "REDIS_CMD_TIMEOUT") stats.timeouts += 1;
@@ -304,7 +322,7 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
     /** M6 lease renew/release (doc 7.11 + Appendix A). 0 on miss, -1 on error. */
     async evalLua(script, keys, args) {
       try {
-        const v = await withTimeout(client.eval(script, keys.length, ...keys, ...args), timeoutMs);
+        const v = await tick(client.eval(script, keys.length, ...keys, ...args), timeoutMs);
         const n = Number(v ?? 0);
         return Number.isFinite(n) ? n : 0;
       } catch (e) {
@@ -316,7 +334,7 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
 
     async getDocMeta(id) {
       try {
-        const v = await withTimeout(client.get(`msg:${id}`), timeoutMs);
+        const v = await tick(client.get(`msg:${id}`), timeoutMs);
         if (!v) return null;
         const parsed: unknown = JSON.parse(v);
         return isMeta(parsed) ? parsed : null;
@@ -335,7 +353,7 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
         accessHash: meta.accessHash,
         dcId: meta.dcId,
       });
-      void withTimeout(client.set(`msg:${id}`, payload, "EX", DOC_TTL_SEC), timeoutMs).catch(() => undefined);
+      void tick(client.set(`msg:${id}`, payload, "EX", DOC_TTL_SEC), timeoutMs).catch(() => undefined);
     },
 
     queryHash(q) {
@@ -344,7 +362,7 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
 
     async getQueryIds(hash) {
       try {
-        const v = await withTimeout(client.get(`q:${hash}`), timeoutMs);
+        const v = await tick(client.get(`q:${hash}`), timeoutMs);
         if (!v) return null;
         const parsed: unknown = JSON.parse(v);
         if (!Array.isArray(parsed)) return null;
@@ -356,7 +374,7 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
 
     putQueryIds(hash, ids) {
       const payload = JSON.stringify(ids.slice(0, 25));
-      void withTimeout(client.set(`q:${hash}`, payload, "EX", QUERY_TTL_SEC), timeoutMs)
+      void tick(client.set(`q:${hash}`, payload, "EX", QUERY_TTL_SEC), timeoutMs)
         .then(() => {
           if (!queryLive.has(hash)) {
             queryLive.add(hash);
@@ -380,9 +398,16 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
 
     async readSnapshot() {
       try {
-        const v = await withTimeout(client.getBuffer(SNAPSHOT_KEY), timeoutMs).catch(() => null);
+        // boot-time read: the floor also covers the handshake race on cold connections
+        const v = await tick(client.getBuffer(SNAPSHOT_KEY), Math.max(timeoutMs, BOOT_READ_MS));
         return v && v.length > 0 ? v : null;
-      } catch {
+      } catch (e) {
+        const code = (e as { code?: string })?.code;
+        if (code === "REDIS_CMD_TIMEOUT") stats.timeouts += 1;
+        else stats.errors += 1;
+        console.warn(
+          `redis: index snapshot read failed (${(e as { message?: string }).message ?? "error"}) — an empty disk will re-crawl`,
+        );
         return null;
       }
     },
@@ -394,7 +419,7 @@ export function openRedisStore(opts: RedisOpenOptions): RedisStore | null {
         console.warn(`redis: snapshot too large (${Math.round(bytes.length / 1024)} KiB); skipping`);
         return;
       }
-      void withTimeout(client.set(SNAPSHOT_KEY, bytes), Math.max(timeoutMs, 10_000)).catch(() => undefined);
+      void tick(client.set(SNAPSHOT_KEY, bytes), Math.max(timeoutMs, 10_000)).catch(() => undefined);
     },
 
     close() {

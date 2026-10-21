@@ -1261,7 +1261,7 @@ export async function main(): Promise<void> {
 
   const app = buildServer({ config: cfg, db, telegram, indexer, redis, modeBox, runtime, setup: setupDeps });
   await app.listen({ port: cfg.port, host: "0.0.0.0" });
-  app.log.info(`BitChord addon serving on :${cfg.port} (v${cfg.addonVersion})`);
+  app.log.info(`MystoTune addon serving on :${cfg.port} (v${cfg.addonVersion})`);
 
   // M6.2 (doc §5 row 3): the setup link lives in the LOGS ONLY — token in the
   // URL fragment so browsers never transmit it (no access-log leakage).
@@ -1274,10 +1274,10 @@ export async function main(): Promise<void> {
 
   // §4.15: Fastify is already serving. Restore a Redis snapshot into an empty
   // disk index BEFORE the Telegram client connects, so the boot sync reads
-  // cursors (§4.11 rule 5) and only fetches newer messages.
+  // cursors (§4.11 rule 5) and only fetches newer messages. Every branch of
+  // the restore logs its outcome (index-loop) — no more silent re-crawls.
   try {
-    const restored = await restoreSnapshotIfEmpty(db, cfg, redis);
-    if (restored > 0) app.log.info(`redis index snapshot restored ${restored} tracks`);
+    await restoreSnapshotIfEmpty(db, cfg, redis);
   } catch (e) {
     void e; // a down Redis must never block boot (§4.11 rule 3)
   }

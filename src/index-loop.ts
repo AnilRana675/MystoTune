@@ -35,6 +35,18 @@ function gzipAsync(input: Buffer): Promise<Buffer> {
 }
 
 /** 4.11 (REDIS_SNAPSHOT=1): replay the Redis index:snapshot on boot when the */
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Real-stream guarantee (§4.11): the very first redis command of a boot must
+ * not race the TLS handshake — wait (bounded) until the store reports up. */
+async function waitRedisUp(redis: RedisStore, deadlineMs = 2_500): Promise<void> {
+  const until = Date.now() + deadlineMs;
+  while (Date.now() < until) {
+    if (redis.status() === "up") return;
+    await sleep(50);
+  }
+}
+
 export async function restoreSnapshotIfEmpty(
   db: Database,
   cfg: AppConfig,
@@ -42,13 +54,33 @@ export async function restoreSnapshotIfEmpty(
 ): Promise<number> {
   if (!(redis && cfg.redis.snapshot)) return 0;
   if (countTracks(db) > 0) return 0; // disk already has the index — skip
-  const gz = await redis.readSnapshot();
-  if (!gz || gz.length === 0) return 0;
-  const json = await new Promise<Buffer>((resolve, reject) => {
-    gunzip(gz, (err, out) => (err ? reject(err) : resolve(Buffer.from(out))));
-  });
-  const snap = JSON.parse(json.toString("utf8")) as IndexSnapshot;
-  return restoreTrackSnapshot(db, snap);
+  await waitRedisUp(redis);
+  let gz: Buffer | null = null;
+  try {
+    gz = await redis.readSnapshot();
+  } catch (e) {
+    console.warn(`redis: index snapshot read failed (${(e as Error).message}) — crawling live`);
+    return 0;
+  }
+  if (!gz || gz.length === 0) {
+    // first boot on the plan: nothing stored yet; this boot's pass writes one
+    console.log("redis: no index snapshot yet — crawling (this boot writes one after its pass)");
+    return 0;
+  }
+  let snap: IndexSnapshot;
+  try {
+    const json = await new Promise<Buffer>((resolve, reject) => {
+      gunzip(gz as Buffer, (err, out) => (err ? reject(err) : resolve(Buffer.from(out))));
+    });
+    snap = JSON.parse(json.toString("utf8")) as IndexSnapshot;
+  } catch (e) {
+    console.warn(`redis: index snapshot unusable (${(e as Error).message}) — crawling`);
+    return 0;
+  }
+  const n = restoreTrackSnapshot(db, snap);
+  if (n > 0) console.log(`redis: index snapshot restored (${n} tracks + sync cursors)`);
+  else console.warn("redis: snapshot carried no usable rows — crawling live");
+  return n;
 }
 
 export class IndexIndexer {

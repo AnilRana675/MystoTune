@@ -26,6 +26,16 @@ import { RELEASE_LUA, RENEW_LUA, deriveInstanceId, SessionLease } from "../src/l
 import { openRedisStore, type RedisStore } from "../src/redis.js";
 import { startFakeRedis } from "./fake-redis.js";
 import { buildTestServer, TEST_SECRET, type TestServer } from "./util.js";
+import {
+  createSchema,
+  exportTrackSnapshot,
+  listCursors,
+  openDb,
+  restoreTrackSnapshot,
+  setCursor,
+  upsertTrack,
+} from "../src/db.js";
+import { restoreSnapshotIfEmpty } from "../src/index-loop.js";
 import { createMediaToken } from "../src/sign.js";
 import { SetupAccess, type LoginCallbacks, type LoginFactory, type SetupChannel, type SetupLogin } from "../src/setup.js";
 import {
@@ -938,5 +948,102 @@ test("setup idle: inactivity discards the login and surfaces login_idle (doc 7.6
     assert.ok(logins.every((l) => l.closeCount >= 1), "idle discard closed the seam");
   } finally {
     await ts.cleanup();
+  }
+});
+
+/* ===================== M6.12 snapshot restore visibility ===================== */
+
+test("index snapshot round-trips tracks + cursors so a restored boot crawls nothing", async () => {
+  const fake = await startFakeRedis();
+  const store = openRedisStore({ url: fake.url, timeoutMs: 400, snapshot: true })!;
+  await waitUp(store);
+  const dir = mkdtempSync(path.join(os.tmpdir(), "m6-snap-"));
+  try {
+    const cfg = loadConfig({
+      PORT: "1",
+      PUBLIC_BASE_URL: "http://127.0.0.1:9",
+      ALLOW_INSECURE_BASE_URL: "1",
+      ADDON_SECRET: TEST_SECRET,
+      MEDIA_SIGNING_KEY: Buffer.alloc(32, 7).toString("base64"),
+      DB_PATH: dir,
+      REDIS_URL: fake.url,
+      REDIS_TIMEOUT_MS: "400",
+      REDIS_SNAPSHOT: "1",
+    });
+    assert.equal(cfg.redis.snapshot, true, "REDIS_SNAPSHOT=1 parses on");
+
+    // source index: two tracks + a real sync cursor
+    const db1 = openDb(path.join(dir, "a.sqlite"));
+    createSchema(db1);
+    upsertTrack(db1, {
+      id: "tg_n-100123_1",
+      chatId: -100123,
+      msgId: 1,
+      title: "Song One",
+      artist: "A",
+      album: null,
+      duration: 100,
+      mime: "audio/mpeg",
+      size: 1000,
+      fileName: "a.mp3",
+      codec: null,
+      container: "mp3",
+      lossless: 0,
+      bitrateKbps: null,
+      docId: 1,
+      source: "telegram",
+      filePath: null,
+      hasThumb: 0,
+      addedAt: 1,
+    });
+    upsertTrack(db1, {
+      id: "tg_n-100123_2",
+      chatId: -100123,
+      msgId: 2,
+      title: "Song Two",
+      artist: "B",
+      album: null,
+      duration: 200,
+      mime: "audio/mpeg",
+      size: 2000,
+      fileName: "b.flac",
+      codec: null,
+      container: "flac",
+      lossless: 1,
+      bitrateKbps: null,
+      docId: 2,
+      source: "telegram",
+      filePath: null,
+      hasThumb: 0,
+      addedAt: 2,
+    });
+    setCursor(db1, -100123, 1234);
+    const snap = exportTrackSnapshot(db1);
+    assert.deepEqual(snap.cursors, [{ chatId: -100123, cursor: 1234 }]);
+
+    // store it exactly like the sync pass does (gzip -> writeSnapshot)
+    const { gzip: gzipCb } = await import("node:zlib");
+    const gz = await new Promise<Buffer>((resolve, reject) =>
+      gzipCb(Buffer.from(JSON.stringify(snap), "utf8"), (e, o) => (e ? reject(e) : resolve(o as Buffer))),
+    );
+    store.writeSnapshot(gz);
+    for (let i = 0; i < 40 && !fake.data.get("index:snapshot"); i++) await sleep(50);
+    assert.ok(fake.data.get("index:snapshot"), "snapshot landed in redis");
+
+    // fresh free-plan disk: restore, then a re-crawl would only see the cursor
+    const db2 = openDb(path.join(dir, "b.sqlite"));
+    createSchema(db2);
+    const restored = await restoreSnapshotIfEmpty(db2, cfg, store);
+    assert.equal(restored, 2, "snapshot restored both tracks");
+    assert.deepEqual(listCursors(db2), [{ chatId: -100123, cursor: 1234 }]);
+
+    // a fresh empty disk without redis never restores
+    const db3 = openDb(path.join(dir, "c.sqlite"));
+    createSchema(db3);
+    assert.equal(await restoreSnapshotIfEmpty(db3, cfg, null), 0, "no redis = no restore");
+  } finally {
+    store.close();
+    await fake.stop();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
