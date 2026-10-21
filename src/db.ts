@@ -6,6 +6,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { isStructured, parseQuery, type ParsedQuery, type SortMode } from "./query";
 
 export interface TrackRow {
   rowid: number | bigint;
@@ -349,53 +350,106 @@ interface CandidateRow {
   r: number; // bm25 rank, lower is better
 }
 
-/**
- * Full search pipeline (§4.6.4): AND first, OR fallback (<5 rows), bm25 ranking,
- * exact title/artist boost, near-identical dedupe (same normalized title+artist,
- * duration within ±2 s; lossless first, then larger file). Max `limit` (25).
- */
-export function searchTracks(db: Database.Database, rawQuery: string | undefined | null, limit = 25): TrackRow[] {
-  const q = ftsQuery(rawQuery);
-  if (!q) return [];
+/* ------------------------------------------------------- typed grammar (M7) */
 
-  const seen = new Set<string>();
-  const candidates: CandidateRow[] = [];
-  for (const r of stmts(db).search.all({ match: q.and, limit: FETCH_LIMIT }) as CandidateRow[]) {
-    if (!seen.has(r.id)) {
-      seen.add(r.id);
-      candidates.push(r);
-    }
+type DynStmt = Database.Statement<Record<string, unknown>>;
+const dynCache = new WeakMap<Database.Database, Map<string, DynStmt>>();
+/** Dynamic grammar SQL has few distinct shapes — cache per db like the fixed stmts. */
+function dyn(db: Database.Database, sql: string): DynStmt {
+  let m = dynCache.get(db);
+  if (!m) {
+    m = new Map();
+    dynCache.set(db, m);
   }
-  if (candidates.length < 5) {
-    for (const r of stmts(db).search.all({ match: q.or, limit: FETCH_LIMIT }) as CandidateRow[]) {
-      if (!seen.has(r.id)) {
-        seen.add(r.id);
-        candidates.push(r);
-      }
-    }
+  let s = m.get(sql);
+  if (!s) {
+    s = db.prepare(sql);
+    m.set(sql, s);
   }
-  if (!candidates.length) return [];
+  return s;
+}
 
-  const normTokens = normalizeText(rawQuery ?? "").split(" ").filter(Boolean);
-  const normOf = (s: string | null | undefined) => normalizeText(s ?? "");
-  const tokensOf = (s: string | null | undefined) => new Set(normOf(s).split(" ").filter(Boolean));
+/** FTS5 units for a typed query: prefix terms, quoted phrases, column filters. */
+function matchUnits(q: ParsedQuery): Array<string> {
+  const tok = (s: string): Array<string> =>
+    normalizeText(s ?? "")
+      .split(" ")
+      .filter(Boolean)
+      .slice(0, 8);
+  const scope = (col: string, vals: Array<string>) => {
+    for (const v of vals) {
+      const ts = tok(v);
+      if (!ts.length) continue;
+      // single word: bare prefix; multiword: exact adjacency (FTS5 col filter)
+      units.push(ts.length === 1 ? `${col} : ${ts[0]}*` : `${col} : "${ts.join(" ")}"`);
+    }
+  };
+  const units: Array<string> = [];
+  for (const t of tok(q.free)) units.push(`"${t}"*`);
+  for (const p of q.phrases) {
+    const ts = tok(p);
+    if (ts.length) units.push(`"${ts.join(" ")}"*`); // adjacency, last token prefix
+  }
+  scope("title", q.title);
+  scope("artist", q.artist);
+  scope("album", q.album);
+  return units.slice(0, 16);
+}
 
-  // boost exact title/artist (§4.6.4, §4.14)
-  const scored = candidates.map((r) => {
-    const titleTokens = tokensOf(r.title);
-    const artistTokens = tokensOf(r.artist);
-    const titleNorm = normOf(r.title);
-    const queryNorm = normTokens.join(" ");
-    let boost = 0;
-    if (titleTokens.size && normTokens.every((t) => titleTokens.has(t))) boost += 4; // all query tokens in title
-    if (artistTokens.size && normTokens.every((t) => artistTokens.has(t))) boost += 3;
-    if (titleNorm === queryNorm) boost += 6; // exact title
-    if (r.artist && normOf(r.artist) === queryNorm) boost += 6; // exact artist
-    return { row: r, score: boost - r.r };
-  });
-  scored.sort((a, b) => b.score - a.score || String(a.row.addedAt).localeCompare(String(b.row.addedAt)));
+/* dynamic WHERE for typed filters: lossless bare flag, dur: window, recent: window */
+function wherePartsOf(parsed: ParsedQuery): Array<{ sql: string; p: Record<string, unknown> }> {
+  const parts: Array<{ sql: string; p: Record<string, unknown> }> = [];
+  if (parsed.lossless) parts.push({ sql: "t.lossless = 1", p: {} });
+  if (parsed.durOp && parsed.durVal !== null) {
+    parts.push({ sql: `t.duration ${parsed.durOp} @dur`, p: { dur: parsed.durVal } });
+  }
+  if (parsed.recentDays !== null) {
+    parts.push({ sql: "t.addedAt >= @since", p: { since: Date.now() - parsed.recentDays * 86_400_000 } });
+  }
+  return parts;
+}
 
-  // dedupe near-identical tracks (same normalized title+artist, duration ±2 s)
+/** non-relevance sorts need dedicated pool ordering (FETCH_LIMIT pool semantics) */
+const POOL_ORD: Record<SortMode, string> = {
+  relevance: "ORDER BY r, t.rowid",
+  recent: "ORDER BY t.addedAt DESC, t.rowid DESC",
+  oldest: "ORDER BY t.addedAt ASC, t.rowid ASC",
+  longest: "ORDER BY t.duration DESC, t.addedAt DESC, t.rowid DESC",
+};
+
+/** Candidate pool for typed queries: FTS match (or full scan when filter-only),
+ * plus typed WHERE, plus the explicit sort order. r is 0 on the scan path. */
+function fetchPool(
+  db: Database.Database,
+  parsed: ParsedQuery,
+  joiner: "and" | "or",
+  match: { and: string; or: string } | null,
+): CandidateRow[] {
+  const wh = wherePartsOf(parsed);
+  const whereSql = wh.map((w) => w.sql).join(" AND ");
+  const params: Record<string, unknown> = { limit: FETCH_LIMIT };
+  if (match) params.match = match[joiner];
+  for (const w of wh) Object.assign(params, w.p);
+  const where = match
+    ? `tracks_fts MATCH @match${whereSql ? ` AND ${whereSql}` : ""}`
+    : `1=1${whereSql ? ` AND ${whereSql}` : ""}`;
+  const sql = match
+    ? `SELECT t.rowid AS rowid, t.*, bm25(tracks_fts, 4.0, 3.0, 2.0, 1.0) AS r
+       FROM tracks_fts f
+       JOIN tracks t ON t.rowid = f.rowid
+       WHERE ${where} ${POOL_ORD[parsed.sort]} LIMIT @limit`
+    : `SELECT t.rowid AS rowid, t.*, 0 AS r FROM tracks t WHERE ${where} ${POOL_ORD[parsed.sort]} LIMIT @limit`;
+  return dyn(db, sql).all(params) as CandidateRow[];
+}
+
+/** Near-identical dedupe (§4.6.4): same normalized title+artist within ±2 s —
+ * lossless first, then larger file. Groups replaced in place so explicit sort
+ * orders survive (sort:longest and friends). Shared by both search paths. */
+function dedupeKeep(
+  scored: Array<{ row: CandidateRow; score: number }>,
+  normOf: (s: string | null | undefined) => string,
+  limit: number,
+): TrackRow[] {
   const kept: TrackRow[] = [];
   const groups: Array<{ key: string; dur: number | null; best: TrackRow }> = [];
   for (const { row } of scored) {
@@ -424,6 +478,106 @@ export function searchTracks(db: Database.Database, rawQuery: string | undefined
     }
   }
   return kept.slice(0, limit);
+}
+
+/**
+ * Full search pipeline (§4.6.4): AND first, OR fallback (<5 rows), bm25 ranking,
+ * exact title/artist boost, near-identical dedupe. Max `limit` (25).
+ * M7.0 grammar: untyped q runs the legacy hot path byte-for-byte (M3 locks it);
+ * typed queries (artist:/album:/title:/ phrases / lossless / dur:/recent:/sort:)
+ * switch to the dynamic pool above.
+ */
+export function searchTracks(db: Database.Database, rawQuery: string | undefined | null, limit = 25): TrackRow[] {
+  const parsed = parseQuery(typeof rawQuery === "string" ? rawQuery : "");
+
+  if (!isStructured(parsed)) {
+    const q = ftsQuery(rawQuery);
+    if (!q) return [];
+
+    const seen = new Set<string>();
+    const candidates: CandidateRow[] = [];
+    for (const r of stmts(db).search.all({ match: q.and, limit: FETCH_LIMIT }) as CandidateRow[]) {
+      if (!seen.has(r.id)) {
+        seen.add(r.id);
+        candidates.push(r);
+      }
+    }
+    if (candidates.length < 5) {
+      for (const r of stmts(db).search.all({ match: q.or, limit: FETCH_LIMIT }) as CandidateRow[]) {
+        if (!seen.has(r.id)) {
+          seen.add(r.id);
+          candidates.push(r);
+        }
+      }
+    }
+    if (!candidates.length) return [];
+
+    const normTokens = normalizeText(rawQuery ?? "").split(" ").filter(Boolean);
+    const normOf = (s: string | null | undefined) => normalizeText(s ?? "");
+    const tokensOf = (s: string | null | undefined) => new Set(normOf(s).split(" ").filter(Boolean));
+
+    // boost exact title/artist (§4.6.4, §4.14)
+    const scored = candidates.map((r) => {
+      const titleTokens = tokensOf(r.title);
+      const artistTokens = tokensOf(r.artist);
+      const titleNorm = normOf(r.title);
+      const queryNorm = normTokens.join(" ");
+      let boost = 0;
+      if (titleTokens.size && normTokens.every((t) => titleTokens.has(t))) boost += 4; // all query tokens in title
+      if (artistTokens.size && normTokens.every((t) => artistTokens.has(t))) boost += 3;
+      if (titleNorm === queryNorm) boost += 6; // exact title
+      if (r.artist && normOf(r.artist) === queryNorm) boost += 6; // exact artist
+      return { row: r, score: boost - r.r };
+    });
+    scored.sort((a, b) => b.score - a.score || String(a.row.addedAt).localeCompare(String(b.row.addedAt)));
+
+    return dedupeKeep(scored, normOf, limit);
+  }
+
+  /* M7.1 structured path: typed units + WHERE filters + explicit sort order */
+  const units = matchUnits(parsed);
+  const match = units.length ? { and: units.join(" AND "), or: units.join(" OR ") } : null;
+  const seen = new Set<string>();
+  const candidates: CandidateRow[] = [];
+  for (const r of fetchPool(db, parsed, "and", match)) {
+    if (!seen.has(r.id)) {
+      seen.add(r.id);
+      candidates.push(r);
+    }
+  }
+  if (candidates.length < 5 && match) {
+    for (const r of fetchPool(db, parsed, "or", match)) {
+      if (!seen.has(r.id)) {
+        seen.add(r.id);
+        candidates.push(r);
+      }
+    }
+  }
+  if (!candidates.length) return [];
+
+  const normOf = (s: string | null | undefined) => normalizeText(s ?? "");
+  const tokensOf = (s: string | null | undefined) => new Set(normOf(s).split(" ").filter(Boolean));
+  // free + scoped tokens feed the containment boosts; the +6 whole-string
+  // equalities stay legacy-only (they compare the full raw string — meaningless
+  // once operators are present)
+  const boostTokens = [parsed.free, ...parsed.title, ...parsed.artist]
+    .map((s) => normalizeText(s ?? ""))
+    .join(" ")
+    .split(" ")
+    .filter(Boolean);
+
+  const scored = candidates.map((r) => {
+    let boost = 0;
+    if (boostTokens.length) {
+      if (tokensOf(r.title).size && boostTokens.every((t) => tokensOf(r.title).has(t))) boost += 4;
+      if (tokensOf(r.artist).size && boostTokens.every((t) => tokensOf(r.artist).has(t))) boost += 3;
+    }
+    return { row: r, score: boost - r.r };
+  });
+  if (parsed.sort === "relevance") {
+    scored.sort((a, b) => b.score - a.score || String(a.row.addedAt).localeCompare(String(b.row.addedAt)));
+  }
+  return dedupeKeep(scored, normOf, limit);
 }
 
 function trackOf(r: CandidateRow): TrackRow {

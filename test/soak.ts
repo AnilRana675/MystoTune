@@ -5,7 +5,7 @@
  * Usage: tsx test/soak.ts [--seconds N] [--workers N] [--out FILE]
  */
 import { createMediaToken } from "../src/sign.js";
-import { buildTestServer, type TestServer } from "./util.js";
+import { buildTestServer, TEST_SECRET, type TestServer } from "./util.js";
 
 const arg = (name: string): string | null => {
   const i = process.argv.indexOf(name);
@@ -112,7 +112,8 @@ async function main(): Promise<void> {
   const sampler = (async (): Promise<void> => {
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 2000));
-      const h = (await (await fetch(`${ts.baseUrl}/healthz`)).json()) as Record<string, number>;
+      // M7.5: ops fields are secret-gated at /{secret}/status now
+      const h = (await (await fetch(`${ts.baseUrl}/${TEST_SECRET}/status`)).json()) as Record<string, number>;
       samples.push({
         rss: Number(h.rss),
         heapUsed: Number(h.heapUsed),

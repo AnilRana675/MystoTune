@@ -151,7 +151,7 @@ test("MONTHLY_BYTES_BUDGET exceeded -> /stream and /media answer plain 404", asy
 });
 
 test("budget env absent keeps the default (no surprise 404s in tests)", async () => {
-  const bs = await buildTestServer(); // MONTHLY_BYTES_BUDGET default 4.5 GB
+  const bs = await buildTestServer(); // MONTHLY_BYTES_BUDGET default 0 = unlimited
   try {
     const row = bs.tracks[0]!;
     const s = await fetchJson(bs, `/${S}/stream/${row.id}`);

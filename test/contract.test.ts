@@ -42,17 +42,27 @@ test("manifest: wrong secret is a 404 without leaking", async () => {
 
 /* ------------------------------------------------------------------ healthz */
 
-test("healthz: reports the documented fields", async () => {
+test("healthz: minimal public shape (ok + mode only)", async () => {
   const res = await fetchJson(ts, "/healthz");
   assert.equal(res.status, 200);
   const h = (await res.json() as any) as Record<string, unknown>;
   assert.equal(h.ok, true);
+  assert.equal(typeof h.mode, "string");
+  // M7.5 privacy split: the unauthenticated route must leak nothing else.
+  assert.deepEqual(Object.keys(h).sort(), ["mode", "ok"]);
+});
+
+test("status: secret-gated ops diagnostics (moved off public healthz)", async () => {
+  const res = await fetchJson(ts, `/${S}/status`);
+  assert.equal(res.status, 200);
+  const s = (await res.json() as any) as Record<string, unknown>;
   for (const k of ["rss", "heapUsed", "heapTotal", "external", "arrayBuffers", "indexCount"]) {
-    assert.equal(typeof h[k], "number", k);
+    assert.equal(typeof s[k], "number", k);
   }
-  assert.equal(typeof h.indexing, "boolean");
-  assert.equal(typeof h.telegram, "string");
-  const counters = h.counters as Record<string, unknown>;
+  assert.equal(typeof s.indexing, "boolean");
+  assert.equal(typeof s.telegram, "string");
+  assert.ok(Array.isArray(s.lastSearches), "lastSearches is secret-gated");
+  const counters = s.counters as Record<string, unknown>;
   for (const k of ["searches", "streams", "media", "bytes"]) {
     assert.equal(typeof counters[k], "number", `counters.${k}`);
   }
