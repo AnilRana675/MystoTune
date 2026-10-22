@@ -194,6 +194,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createSchema, openDb, searchTracks, upsertTrack, type TrackRow } from "../src/db.js";
+import { buildTestServer, TEST_SECRET } from "./util.js";
 
 /* /tmp is read-only in some dev sandboxes; /tmp/opencode is the approved base */
 const tmpBase = existsSync("/tmp/opencode") ? "/tmp/opencode" : os.tmpdir();
@@ -252,7 +253,7 @@ test("search: typed grammar filters, phrases, scoped fields, explicit sorts", ()
     /* scoped fields */
     assert.deepEqual(titleOf(searchTracks(db, "artist:m83")), ["Midnight City"]);
     assert.deepEqual(titleOf(searchTracks(db, "album:hurry")), ["Midnight City"]);
-    assert.deepEqual(titleOf(searchTracks(db, "title:'Day Glow'")), ["Day Glow"]);
+    assert.deepEqual(titleOf(searchTracks(db, 'title:"Day Glow"')), ["Day Glow"]);
 
     /* quoted phrases: adjacency, order matters */
     assert.deepEqual(titleOf(searchTracks(db, '"skinny love"')), ["Skinny Love"]);
@@ -285,5 +286,106 @@ test("search: typed grammar filters, phrases, scoped fields, explicit sorts", ()
   } finally {
     db.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ---------------- M7.6 regression: ordering, dedupe survivor, binding parity ---------------- */
+
+function row(n: number, title: string, artist: string, duration: number, lossless: number, ageDays: number, mime = "audio/mpeg", container = "mp3") {
+  return {
+    id: `tg_n-7199_${100 + n}`,
+    chatId: -7199,
+    msgId: 100 + n,
+    title,
+    artist,
+    album: null,
+    duration,
+    mime,
+    size: lossless ? 9000 + n : 400 + n,
+    fileName: `${title.toLowerCase().replace(/\s+/g, "-")}.${container}`,
+    codec: null,
+    container,
+    lossless,
+    bitrateKbps: null,
+    docId: 700 + n,
+    source: "telegram" as const,
+    filePath: null,
+    hasThumb: 0,
+    addedAt: Date.now() - Math.round(ageDays * 86_400_000),
+  };
+}
+
+test("search: explicit sorts read one globally ordered OR pool (no unsorted fallback tail)", () => {
+  const dir = mkdtempSync(path.join(tmpBase, "m7-or-order-"));
+  const db = openDb(path.join(dir, "o.sqlite"));
+  try {
+    createSchema(db);
+    upsertTrack(db, row(0, "T400", "Beta", 400, 0, 20));
+    upsertTrack(db, row(1, "T300", "Beta", 300, 0, 21));
+    upsertTrack(db, row(2, "T200", "Beta", 200, 0, 22));
+    upsertTrack(db, row(3, "T100", "Alpha", 100, 0, 23));
+    upsertTrack(db, row(4, "T50", "Beta", 50, 0, 24));
+    // AND pool (artist:alpha* AND beta*) is empty; OR pool holds all five and
+    // must carry the sort order itself (pre-fix tail was bm25-ordered).
+    assert.deepEqual(titleOf(searchTracks(db, "artist:alpha beta sort:longest")), [
+      "T400",
+      "T300",
+      "T200",
+      "T100",
+      "T50",
+    ]);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("search: near-dup survivor follows the active sort, not always lossless", () => {
+  const dir = mkdtempSync(path.join(tmpBase, "m7-dedupe-sort-"));
+  const db = openDb(path.join(dir, "d.sqlite"));
+  try {
+    createSchema(db);
+    upsertTrack(db, row(0, "Dup Song", "ArtistX", 240, 1, 30, "audio/flac", "flac")); // older lossless
+    upsertTrack(db, row(1, "Dup Song", "ArtistX", 241, 0, 2)); // newer lossy
+    const recent = searchTracks(db, "dup sort:recent");
+    assert.equal(recent.length, 1);
+    assert.equal(recent[0]?.mime, "audio/mpeg", "sort:recent keeps the newest copy");
+    const oldest = searchTracks(db, "dup sort:oldest");
+    assert.equal(oldest.length, 1);
+    assert.equal(oldest[0]?.mime, "audio/flac", "sort:oldest keeps the oldest copy");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("search: dropped grammar tokens never resurface as keywords (path parity)", () => {
+  const dir = mkdtempSync(path.join(tmpBase, "m7-binding-"));
+  const db = openDb(path.join(dir, "b.sqlite"));
+  try {
+    createSchema(db);
+    upsertTrack(db, row(0, "Dur Soon", "Zed", 120, 0, 3));
+    upsertTrack(db, row(1, "Lossless One", "Zed", 200, 1, 4, "audio/flac", "flac"));
+    // legacy path (no structured clause survives): junk operator fully dropped
+    assert.deepEqual(titleOf(searchTracks(db, "dur:soon")), []);
+    // structured path (a filter is present): junk operator dropped identically
+    assert.deepEqual(titleOf(searchTracks(db, "dur:soon lossless")), ["Lossless One"]);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("search: HTTP route serves typed grammar (sort:longest end to end)", async () => {
+  const ts = await buildTestServer();
+  try {
+    const res = await fetch(`${ts.baseUrl}/${TEST_SECRET}/search?q=${encodeURIComponent("sort:longest")}`);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { tracks: Array<{ duration?: number | null }> };
+    assert.ok(Array.isArray(body.tracks) && body.tracks.length > 0);
+    const durs = body.tracks.map((t) => t.duration ?? -1);
+    assert.deepEqual(durs, [...durs].sort((a, b) => b - a));
+  } finally {
+    await ts.cleanup();
   }
 });

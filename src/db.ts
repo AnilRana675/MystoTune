@@ -393,7 +393,10 @@ function matchUnits(q: ParsedQuery): Array<string> {
   scope("title", q.title);
   scope("artist", q.artist);
   scope("album", q.album);
-  return units.slice(0, 16);
+  // No artificial cap: q is capped at 300 chars upstream (server), so the unit
+  // count is already bounded. Trimming here would silently drop AND constraints
+  // and broaden results (pre-M7.6 slice(0,16) bug).
+  return units;
 }
 
 /* dynamic WHERE for typed filters: lossless bare flag, dur: window, recent: window */
@@ -442,14 +445,28 @@ function fetchPool(
   return dyn(db, sql).all(params) as CandidateRow[];
 }
 
-/** Near-identical dedupe (§4.6.4): same normalized title+artist within ±2 s —
- * lossless first, then larger file. Groups replaced in place so explicit sort
- * orders survive (sort:longest and friends). Shared by both search paths. */
+/** Near-identical dedupe (§4.6.4): same normalized title+artist within ±2 s.
+ * Relevance keeps the §4.6.4 preference (lossless, then larger file) and
+ * replaces in place so bm25 positions survive. Explicit sorts must pick the
+ * survivor that matches the requested order (recent→newest, oldest→oldest,
+ * longest→longest) — pre-M7.6 bug: an older lossless copy could jump ahead of
+ * a newer lossy one under sort:recent — then re-sort the kept slice so the
+ * in-place survivor lands at its correct rank. */
 function dedupeKeep(
   scored: Array<{ row: CandidateRow; score: number }>,
   normOf: (s: string | null | undefined) => string,
   limit: number,
+  sort: SortMode = "relevance",
 ): TrackRow[] {
+  const preferCandidate = (best: TrackRow, row: CandidateRow): boolean => {
+    if (sort === "recent") return row.addedAt > best.addedAt;
+    if (sort === "oldest") return row.addedAt < best.addedAt;
+    if (sort === "longest") return (row.duration ?? -1) > (best.duration ?? -1);
+    return (
+      (row.lossless === 1 && best.lossless !== 1) ||
+      (row.lossless === best.lossless && (best.size ?? 0) < (row.size ?? 0))
+    );
+  };
   const kept: TrackRow[] = [];
   const groups: Array<{ key: string; dur: number | null; best: TrackRow }> = [];
   for (const { row } of scored) {
@@ -464,18 +481,23 @@ function dedupeKeep(
       const tr = trackOf(row);
       groups.push({ key, dur, best: tr });
       kept.push(tr);
-    } else {
-      // prefer lossless, then larger file (§4.6.4)
-      const better =
-        (row.lossless === 1 && g.best.lossless !== 1) ||
-        (row.lossless === g.best.lossless && (g.best.size ?? 0) < (row.size ?? 0));
-      if (better) {
-        const tr = trackOf(row);
-        kept[kept.indexOf(g.best)] = tr;
-        g.best = tr;
-        g.dur = dur;
-      }
+    } else if (preferCandidate(g.best, row)) {
+      const tr = trackOf(row);
+      kept[kept.indexOf(g.best)] = tr;
+      g.best = tr;
+      g.dur = dur;
     }
+  }
+  if (sort !== "relevance") {
+    const by: Record<"recent" | "oldest" | "longest", (a: TrackRow, b: TrackRow) => number> = {
+      recent: (a, b) => Number(b.addedAt) - Number(a.addedAt) || Number(b.rowid) - Number(a.rowid),
+      oldest: (a, b) => Number(a.addedAt) - Number(b.addedAt) || Number(a.rowid) - Number(b.rowid),
+      longest: (a, b) =>
+        (b.duration ?? -1) - (a.duration ?? -1) ||
+        Number(b.addedAt) - Number(a.addedAt) ||
+        Number(b.rowid) - Number(a.rowid),
+    };
+    kept.sort(by[sort]);
   }
   return kept.slice(0, limit);
 }
@@ -491,7 +513,10 @@ export function searchTracks(db: Database.Database, rawQuery: string | undefined
   const parsed = parseQuery(typeof rawQuery === "string" ? rawQuery : "");
 
   if (!isStructured(parsed)) {
-    const q = ftsQuery(rawQuery);
+    // Bind the lexer's degradation output, not the raw string: tokens the
+    // grammar dropped (e.g. a junk `dur:soon`) must not resurface here as
+    // keyword searches (pre-M7.6 path-dependent behavior).
+    const q = ftsQuery(parsed.free);
     if (!q) return [];
 
     const seen = new Set<string>();
@@ -512,7 +537,7 @@ export function searchTracks(db: Database.Database, rawQuery: string | undefined
     }
     if (!candidates.length) return [];
 
-    const normTokens = normalizeText(rawQuery ?? "").split(" ").filter(Boolean);
+    const normTokens = normalizeText(parsed.free).split(" ").filter(Boolean);
     const normOf = (s: string | null | undefined) => normalizeText(s ?? "");
     const tokensOf = (s: string | null | undefined) => new Set(normOf(s).split(" ").filter(Boolean));
 
@@ -534,19 +559,20 @@ export function searchTracks(db: Database.Database, rawQuery: string | undefined
     return dedupeKeep(scored, normOf, limit);
   }
 
-  /* M7.1 structured path: typed units + WHERE filters + explicit sort order */
+  /* M7.1 structured path: typed units + WHERE filters + explicit sort order.
+   * Explicit sorts read ONE globally ordered pool: the AND pool is a strict
+   * subset of the OR pool, so appending an unsorted OR fallback would break
+   * sort:longest/recent/oldest order (pre-M7.6 bug). Filter/sort-only queries
+   * (units empty) are deliberate browse mode — a sorted window of the library. */
   const units = matchUnits(parsed);
   const match = units.length ? { and: units.join(" AND "), or: units.join(" OR ") } : null;
   const seen = new Set<string>();
   const candidates: CandidateRow[] = [];
-  for (const r of fetchPool(db, parsed, "and", match)) {
-    if (!seen.has(r.id)) {
-      seen.add(r.id);
-      candidates.push(r);
-    }
-  }
-  if (candidates.length < 5 && match) {
-    for (const r of fetchPool(db, parsed, "or", match)) {
+  const joins: Array<"and" | "or"> =
+    match && parsed.sort === "relevance" ? ["and", "or"] : match ? ["or"] : ["and"];
+  for (const joiner of joins) {
+    if (joiner === "or" && candidates.length >= 5) break; // relevance fallback rule only
+    for (const r of fetchPool(db, parsed, joiner, match)) {
       if (!seen.has(r.id)) {
         seen.add(r.id);
         candidates.push(r);
@@ -577,7 +603,7 @@ export function searchTracks(db: Database.Database, rawQuery: string | undefined
   if (parsed.sort === "relevance") {
     scored.sort((a, b) => b.score - a.score || String(a.row.addedAt).localeCompare(String(b.row.addedAt)));
   }
-  return dedupeKeep(scored, normOf, limit);
+  return dedupeKeep(scored, normOf, limit, parsed.sort);
 }
 
 function trackOf(r: CandidateRow): TrackRow {
