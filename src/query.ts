@@ -32,6 +32,8 @@ export interface ParsedQuery {
   durOp: DurOp | null;
   durVal: number | null;
   recentDays: number | null;
+  /** true when an explicit sort: token was present (browse intent when no terms) */
+  sorted: boolean;
   sort: SortMode;
 }
 
@@ -53,6 +55,7 @@ export function parseQuery(raw: string | undefined | null): ParsedQuery {
     durOp: null,
     durVal: null,
     recentDays: null,
+    sorted: false,
     sort: "relevance",
   };
   if (!raw) return q;
@@ -75,8 +78,9 @@ export function parseQuery(raw: string | undefined | null): ParsedQuery {
     const m = OP_RE.exec(tok);
     if (!m) {
       const ph = poolOf(tok, pool);
-      if (ph !== null) q.phrases.push(ph); // bare "…" → adjacency in any column
-      else free.push(tok); // plain word — legacy keyword behavior
+      if (ph !== null) {
+        if (ph.trim()) q.phrases.push(ph); // bare "…" → adjacency in any column
+      } else free.push(tok); // plain word — legacy keyword behavior
       continue;
     }
     const kind = (m[1] ?? "").toLowerCase();
@@ -109,7 +113,10 @@ export function parseQuery(raw: string | undefined | null): ParsedQuery {
       }
       case "sort": {
         const s = val.toLowerCase();
-        if (s === "relevance" || s === "recent" || s === "oldest" || s === "longest") q.sort = s;
+        if (s === "relevance" || s === "recent" || s === "oldest" || s === "longest") {
+          q.sort = s;
+          q.sorted = true;
+        }
         break;
       }
     }
@@ -135,6 +142,7 @@ export function isStructured(q: ParsedQuery): boolean {
     q.lossless ||
     q.durVal !== null ||
     q.recentDays !== null ||
+    q.sorted ||
     q.sort !== "relevance"
   );
 }

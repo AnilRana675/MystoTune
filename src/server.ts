@@ -393,6 +393,9 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
       quality: qualityLabel(d),
       codec: d.codec ?? undefined,
       container: d.container ?? undefined,
+      // M7.7: protocol bitrate is bits/s; the index stores kbps. Absent stays
+      // absent so BitChord falls back to the requested tier (source-verified).
+      bitrate: row.bitrateKbps ? row.bitrateKbps * 1000 : undefined,
       manifest: "none",
       encrypted: false,
     });

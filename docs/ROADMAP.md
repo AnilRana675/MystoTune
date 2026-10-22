@@ -215,13 +215,6 @@ iberately not built: full status page = the `/status`
   monthly egress budget now defaults to unlimited (`MONTHLY_BYTES_BUDGET=0`
   opt-in cap; also fixed the wizard options screen coercing a typed 0 back
   into the old 4.5 GB default).
-
-## Open drills (manual acceptance on Render)
-
-- [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)
-- [ ] Play one MP3 and one FLAC from the deployed instance
-- [ ] Five consecutive redeploys without `AUTH_KEY_DUPLICATED` (the lease
-      code + fake-Redis tests cover the mechanism; the drill is manual)
 - **M7.5 ✅ health privacy split (v0.7.0-discovery follow-up)** — `/healthz` is
   unauthenticated by contract (Render checks, pingers), so the M7.3 additions
   were a leak: anyone with the URL could read the `lastSearches` ring (raw
@@ -231,3 +224,32 @@ iberately not built: full status page = the `/status`
   which keeps the M6.2 wizard payload while the setup site is open and rides
   the wizard closure fields (`closed`/`publicUrl`) on top of the ops payload
   after finish — both contracts on one secret route.
+- **M7.6 ✅ security + correctness remediation (pre-merge review)** — signed
+  `/media` and `/art` tokens had a length-confusion bug (a wrong-length
+  signature compared against a padded copy verified as equal: forged,
+  never-expiring media URLs were possible); both verifiers now reject any
+  signature whose length differs before the constant-time compare, with a
+  regression table for 0/1/31/33-byte forgeries. Explicit sorts now read one
+  globally ordered pool, near-dup survivors follow the active sort, grammar
+  tokens dropped by the lexer can never resurface as keywords, and the bench,
+  soak and compose probes moved to the secret status route (the privacy split
+  had broken their health checks).
+- **M7.7 ✅ BitChord-compat polish (source-verified audit)** — `/stream` now
+  returns `bitrate` in bits/s (the index stores kbps; absent stays absent so
+  BitChord falls back to the requested tier) and PCM/WAV rows advertise
+  `format: "wav"` instead of the unknown codec `pcm`. Search edge cases fixed:
+  explicit sorts are strict-first (the AND pool wins when it has ≥5 rows — the
+  M7.6 always-OR fix had let OR-only rows leak into sorted results), `q=""`
+  no longer returns the whole library, and `sort:relevance` alone browses
+  consistently with the other sort modes. Policy decisions documented in the
+  README: quality tiers stay advisory (single canonical rendition — no
+  transcoding), budget exhaustion stays a deliberate 404 for BitChord
+  fallback, and the one-time setup link in the deploy log is a known
+  sensitivity (rotate `ADDON_SECRET` after setup if needed).
+
+## Open drills (manual acceptance on Render)
+
+- [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)
+- [ ] Play one MP3 and one FLAC from the deployed instance
+- [ ] Five consecutive redeploys without `AUTH_KEY_DUPLICATED` (the lease
+      code + fake-Redis tests cover the mechanism; the drill is manual)

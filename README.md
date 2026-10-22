@@ -46,6 +46,15 @@ Redis session-lease hand-over safe, doc §7.11), redeploys overlap for ≤15 s
 without killing your Telegram session, and a failed login re-opens setup
 with a banner. Details in `docs/render.md`.
 
+BitChord-compat notes (verified against BitChord's source): `quality=LOW/HIGH/
+LOSSLESS` is advisory — the addon serves the channel's canonical rendition and
+labels it; there is no transcoding and no sibling rendition. Budget exhaustion
+answers 404 on purpose so BitChord treats the track as a miss and falls back
+instead of retrying. The one-time setup link is printed to the deploy log by
+design (token in the URL fragment) — treat Render logs as sensitive; rotating
+`ADDON_SECRET` after setup invalidates old links but also changes the addon URL
+in BitChord.
+
 ### Search grammar (what you can type in BitChord)
 
 Plain words work exactly as before — the grammar is opt-in:
@@ -130,9 +139,9 @@ max 2 active streams, 0 queued, no floods. Full JSON: `docs/m0-soak-baseline.jso
 (uncapped-dev comparison run kept at `docs/m0-soak-baseline-unbounded.json`).
 M2 re-run after the byte-bridge rework: 28 616 requests in 26 s, 0 × 5xx, p95 5 ms,
 peak RSS 147 620 KiB — `docs/m2-soak-baseline.json`. M5 re-run under the FR-19
-two-per-token admission (`--no-budget`: the storm outpaces the default 4.5 GB
-monthly budget in ~15 s, which would otherwise flip /media to its §4.15 plain-404
-fallback mid-run): 28 527 requests in 60 s, **0 × 5xx**, served 7.9 GB, p50 4 ms /
+two-per-token admission (`--no-budget`: the storm would outpace any configured
+soft cap — the default is now unlimited; a 4.5 GB cap would flip /media to its
+§4.15 plain-404 fallback in ~15 s): 28 527 requests in 60 s, **0 × 5xx**, served 7.9 GB, p50 4 ms /
 p95 9 ms, max 2 active / 0 queued, RSS 227 872 KiB — `docs/m5-soak-baseline.json`.
 That 227 MB number is a harness artifact, not the service: `test/soak.ts` runs the
 server in-process under tsx, so `/healthz` RSS counts the load generator and the

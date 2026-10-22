@@ -560,23 +560,39 @@ export function searchTracks(db: Database.Database, rawQuery: string | undefined
   }
 
   /* M7.1 structured path: typed units + WHERE filters + explicit sort order.
-   * Explicit sorts read ONE globally ordered pool: the AND pool is a strict
-   * subset of the OR pool, so appending an unsorted OR fallback would break
-   * sort:longest/recent/oldest order (pre-M7.6 bug). Filter/sort-only queries
-   * (units empty) are deliberate browse mode — a sorted window of the library. */
+   * Strict-first for every mode: the AND pool (all units) wins when it has
+   * enough rows; otherwise ONE OR pool is fetched — each pool carries its own
+   * ORDER BY, so ordering stays global (pre-M7.6 bug: appending an unsorted OR
+   * fallback broke explicit sorts; M7.6's "always OR" then ignored strict
+   * matching when the AND pool was already rich).
+   * Filter/sort-only queries are browse mode — a sorted window of the library;
+   * junk-only queries (no units, no filters, no sort token) return []. */
   const units = matchUnits(parsed);
   const match = units.length ? { and: units.join(" AND "), or: units.join(" OR ") } : null;
+  if (!match && !wherePartsOf(parsed).length && !parsed.sorted) return [];
   const seen = new Set<string>();
   const candidates: CandidateRow[] = [];
-  const joins: Array<"and" | "or"> =
-    match && parsed.sort === "relevance" ? ["and", "or"] : match ? ["or"] : ["and"];
-  for (const joiner of joins) {
-    if (joiner === "or" && candidates.length >= 5) break; // relevance fallback rule only
-    for (const r of fetchPool(db, parsed, joiner, match)) {
+  const add = (rows: CandidateRow[]): void => {
+    for (const r of rows) {
       if (!seen.has(r.id)) {
         seen.add(r.id);
         candidates.push(r);
       }
+    }
+  };
+  if (!match) {
+    add(fetchPool(db, parsed, "and", null)); // filter-only browse window
+  } else {
+    const strict = fetchPool(db, parsed, "and", match);
+    if (strict.length >= 5) {
+      add(strict);
+    } else if (parsed.sort === "relevance") {
+      // legacy rule: union AND + OR, then the scorer re-ranks everything
+      add(strict);
+      add(fetchPool(db, parsed, "or", match));
+    } else {
+      // explicit sort: one globally ordered pool (AND rows are a subset of OR)
+      add(fetchPool(db, parsed, "or", match));
     }
   }
   if (!candidates.length) return [];

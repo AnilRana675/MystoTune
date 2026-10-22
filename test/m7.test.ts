@@ -389,3 +389,57 @@ test("search: HTTP route serves typed grammar (sort:longest end to end)", async 
     await ts.cleanup();
   }
 });
+
+/* ---------------- M7.7 BitChord-compat + edge-case regressions ---------------- */
+
+test("search: explicit sorts are strict-first (AND pool wins when it has >= 5 rows)", () => {
+  const dir = mkdtempSync(path.join(tmpBase, "m7-strict-sort-"));
+  const db = openDb(path.join(dir, "s.sqlite"));
+  try {
+    createSchema(db);
+    for (let i = 0; i < 5; i++) upsertTrack(db, row(i, `Strict ${i}`, "Alpha Beta", 100 + i * 10, 0, 2 + i));
+    upsertTrack(db, row(9, "Long Or", "Alpha", 999, 0, 1)); // OR-only, longest overall
+    const titles = titleOf(searchTracks(db, "artist:alpha beta sort:longest"));
+    assert.deepEqual(titles, ["Strict 4", "Strict 3", "Strict 2", "Strict 1", "Strict 0"]);
+    assert.ok(!titles.includes("Long Or"), "OR-only row must not leak when the AND pool is rich");
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("search: empty phrase returns nothing; sort:relevance alone is a browse window", () => {
+  const dir = mkdtempSync(path.join(tmpBase, "m7-browse-"));
+  const db = openDb(path.join(dir, "q.sqlite"));
+  try {
+    createSchema(db);
+    upsertTrack(db, row(0, "Browse A", "YA", 100, 0, 1));
+    upsertTrack(db, row(1, "Browse B", "YB", 200, 0, 2));
+    assert.deepEqual(titleOf(searchTracks(db, '""')), [], "empty phrase must not browse the library");
+    assert.equal(titleOf(searchTracks(db, "sort:relevance")).length, 2, "explicit sort:relevance browses");
+    assert.deepEqual(titleOf(searchTracks(db, "sort:longest")), ["Browse B", "Browse A"]);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stream: bitrate in bps and wav format for PCM rows (BitChord compat)", async () => {
+  const ts = await buildTestServer();
+  try {
+    const fixture = ts.db.prepare("SELECT id FROM tracks LIMIT 1").get() as { id: string };
+    ts.db
+      .prepare(
+        "UPDATE tracks SET bitrateKbps = 320, mime = 'audio/wav', fileName = 'compat.wav', codec = 'pcm', container = 'wav' WHERE id = @id",
+      )
+      .run({ id: fixture.id });
+    const res = await fetch(`${ts.baseUrl}/${TEST_SECRET}/stream/${encodeURIComponent(fixture.id)}`);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { format?: string; bitrate?: number; container?: string };
+    assert.equal(body.format, "wav", "pcm codec advertises wav (BitChord unknown-codec fallback)");
+    assert.equal(body.bitrate, 320000, "kbps stored -> bps on the wire");
+    assert.equal(body.container, "wav");
+  } finally {
+    await ts.cleanup();
+  }
+});

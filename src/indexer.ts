@@ -183,7 +183,15 @@ export function audioQuality(d: AudioDescriptor): AudioQuality {
 
 /** "format" per row/spec examples: codec when known, else ext, else mime subtype, else container. */
 export function formatOf(d: AudioDescriptor, fileName: string | null | undefined, mime: string | null | undefined): string | null {
-  if (d.codec) return d.codec;
+  if (d.codec) {
+    // WAV rows carry codec "pcm"; BitChord treats pcm as an unknown codec and
+    // falls back to the container anyway — advertise "wav" so the format is
+    // meaningful to clients that read it directly (§4.3).
+    if (d.codec.toLowerCase() === "pcm" && (d.container === "wav" || /\.wav$/i.test(fileName ?? ""))) {
+      return "wav";
+    }
+    return d.codec;
+  }
   if (fileName) {
     const ext = fileName.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase();
     if (ext) return ext;
