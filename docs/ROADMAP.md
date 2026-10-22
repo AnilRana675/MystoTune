@@ -241,7 +241,10 @@ iberately not built: full status page = the `/status`
   explicit sorts are strict-first (the AND pool wins when it has ≥5 rows — the
   M7.6 always-OR fix had let OR-only rows leak into sorted results), `q=""`
   no longer returns the whole library, and `sort:relevance` alone browses
-  consistently with the other sort modes. Policy decisions documented in the
+  consistently with the other sort modes. AIFF descriptor gaps closed:
+  `audio/aiff` + `audio/x-aiff` MIME and the `.aif` extension resolve to
+  lossless PCM (no fabricated size-derived bitrate), and `.aif` docs now pass
+  the audio filter so they are indexed at all. Policy decisions documented in the
   README: quality tiers stay advisory (single canonical rendition — no
   transcoding), budget exhaustion stays a deliberate 404 for BitChord
   fallback, and the one-time setup link in the deploy log is a known

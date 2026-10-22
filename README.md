@@ -128,7 +128,7 @@ headers are committed, so cold/FloodWait/expired-reference failures surface as r
 ## Tests & soak
 
 ```bash
-npm test                        # 146 assertions across contract/range/query/admission/fault/m1/m2/m3/m4/m6/m7
+npm test                        # 148 assertions across contract/range/query/admission/fault/m1/m2/m3/m4/m6/m7
 npm run soak -- --seconds 60 --no-budget --out docs/m5-soak-baseline.json
 ```
 
