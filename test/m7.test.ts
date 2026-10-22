@@ -416,6 +416,8 @@ test("search: empty phrase returns nothing; sort:relevance alone is a browse win
     upsertTrack(db, row(0, "Browse A", "YA", 100, 0, 1));
     upsertTrack(db, row(1, "Browse B", "YB", 200, 0, 2));
     assert.deepEqual(titleOf(searchTracks(db, '""')), [], "empty phrase must not browse the library");
+    assert.deepEqual(titleOf(searchTracks(db, 'artist:"..."')), [], "punctuation-only scope is empty, not a browse");
+    assert.deepEqual(titleOf(searchTracks(db, 'artist:""')), [], "empty scoped phrase is empty, not a browse");
     assert.equal(titleOf(searchTracks(db, "sort:relevance")).length, 2, "explicit sort:relevance browses");
     assert.deepEqual(titleOf(searchTracks(db, "sort:longest")), ["Browse B", "Browse A"]);
   } finally {
@@ -439,6 +441,19 @@ test("stream: bitrate in bps and wav format for PCM rows (BitChord compat)", asy
     assert.equal(body.format, "wav", "pcm codec advertises wav (BitChord unknown-codec fallback)");
     assert.equal(body.bitrate, 320000, "kbps stored -> bps on the wire");
     assert.equal(body.container, "wav");
+
+    // AIFF PCM must advertise aiff, not the raw "pcm" codec label
+    const second = ts.db.prepare("SELECT id FROM tracks LIMIT 1 OFFSET 1").get() as { id: string };
+    ts.db
+      .prepare(
+        "UPDATE tracks SET bitrateKbps = NULL, mime = 'audio/aiff', fileName = 'compat.aiff', codec = 'pcm', container = 'aiff' WHERE id = @id",
+      )
+      .run({ id: second.id });
+    const aiff = await fetch(`${ts.baseUrl}/${TEST_SECRET}/stream/${encodeURIComponent(second.id)}`);
+    assert.equal(aiff.status, 200);
+    const aiffBody = (await aiff.json()) as { format?: string; container?: string };
+    assert.equal(aiffBody.format, "aiff", "pcm in an aiff container advertises aiff");
+    assert.equal(aiffBody.container, "aiff");
   } finally {
     await ts.cleanup();
   }
