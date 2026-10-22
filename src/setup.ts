@@ -469,7 +469,7 @@ export class SetupManager {
     const allowDownloads = body.allowDownloads === undefined ? this.options.allowDownloads : body.allowDownloads === true;
     const budget = Number(body.monthlyBytesBudget ?? this.options.monthlyBytesBudget);
     if (!Number.isSafeInteger(budget) || budget < 0 || budget > 1_000_000_000_000) {
-      throw new SetupError("bad_options", "The monthly budget must be a plain byte count", "For example 4500000000 for 4.5 GB");
+      throw new SetupError("bad_options", "The monthly budget must be a plain byte count", "0 means unlimited; for example 4500000000 for 4.5 GB");
     }
     const channels = Array.isArray(body.channels) ? (body.channels as unknown[]) : this.options.channels;
     if (!channels.every((c) => typeof c === "number" && Number.isSafeInteger(c) && c <= -100)) {
@@ -826,9 +826,9 @@ button:disabled{opacity:.4}.hint{color:#9ab;font-size:.85rem}.banner{background:
 <div id="pw-row" class="hidden"><label>2FA password<input id="l-pw" type="password"></label><button id="b-pw">Unlock</button></div>
 <p id="l-err" class="hint"></p></section>
 <section id="s-channels" class="hidden"><h1>Channels</h1><div id="ch-list"></div><p id="ch-note" class="hint"></p><button id="b-channels">Continue</button></section>
-<section id="s-options" class="hidden"><h1>Options</h1><p>Preset: downloads on · 4.5&nbsp;GB monthly budget · downloads are tuned for Render's free plan.</p>
+<section id="s-options" class="hidden"><h1>Options</h1><p>Preset: downloads on · unlimited monthly bandwidth · downloads are tuned for Render's free plan.</p>
 <label><input id="o-dl" type="checkbox" checked> allow file downloads</label>
-<label>Monthly bytes budget<input id="o-budget" inputmode="numeric" value="4500000000"></label>
+<label>Monthly bytes budget (0 = unlimited)<input id="o-budget" inputmode="numeric" value="0"></label>
 <button id="b-options">Verify</button><p id="o-err" class="hint"></p></section>
 <section id="s-verify" class="hidden"><h1>Verify</h1><div id="v-rows"></div><button id="b-verify">Run checks</button><button id="b-finish" class="hidden">Finish setup</button><p id="v-err" class="hint"></p></section>
 <section id="s-done" class="hidden"><h1>Done</h1><p>Add the addon in BitChord: <b>Settings → Sources → Add an addon</b></p>
@@ -904,8 +904,11 @@ $("b-channels").onclick=function(){var ids=[];
   if(!ids.length){msg("ch-note","Select at least one channel.");return}
   setk("options")};
 // 5. options → 6. verify (server runs the doc 7.8 checks)
-$("b-options").onclick=function(){msg("o-err");
-  rq("options",{allowDownloads:$("o-dl").checked,monthlyBytesBudget:Number($("o-budget").value)||0,channels:selectedIds()})
+$("b-options").onclick=function(){
+  var raw=$("o-budget").value.trim();var budget=raw===""?0:Number(raw);
+  if(!Number.isSafeInteger(budget)||budget<0){msg("o-err","Monthly budget must be a whole byte count (0 = unlimited).");return}
+  msg("");
+  rq("options",{allowDownloads:$("o-dl").checked,monthlyBytesBudget:budget,channels:selectedIds()})
     .then(function(){setk("verify")},function(e){msg("o-err",e.message+(e.next?" — "+e.next:""))})};
 function selectedIds(){return channels.map(function(c){return c.id}).length&&Array.from(document.querySelectorAll("#ch-list input[type=checkbox]:checked")).map(function(cb){return Number(cb.value)})}
 $("b-verify").onclick=function(){msg("v-err");$("b-verify").disabled=true;

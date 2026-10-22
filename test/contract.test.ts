@@ -66,6 +66,14 @@ test("status: secret-gated ops diagnostics (moved off public healthz)", async ()
   for (const k of ["searches", "streams", "media", "bytes"]) {
     assert.equal(typeof counters[k], "number", `counters.${k}`);
   }
+  // M7.6: the ring records raw query strings and keeps exactly the newest ten.
+  for (let i = 1; i <= 11; i++) {
+    await fetchJson(ts, `/${S}/search?q=${encodeURIComponent(`probe${i}`)}`);
+  }
+  const s2 = (await (await fetchJson(ts, `/${S}/status`)).json() as any) as Record<string, unknown>;
+  const ring = s2.lastSearches as string[];
+  assert.equal(ring.length, 10, "lastSearches caps at ten");
+  assert.deepEqual(ring.slice(-10), Array.from({ length: 10 }, (_, i) => `probe${i + 2}`));
 });
 
 /* ------------------------------------------------------------------- search */

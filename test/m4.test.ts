@@ -206,6 +206,32 @@ test("sign: art tokens are kind-tagged and cannot cross onto /media", () => {
   assert.equal(verifyArtToken(art, key, 1_060_000), null);
 });
 
+test("sign: wrong-length signatures never verify (length-confusion regression)", () => {
+  const key = Buffer.alloc(32, 9);
+  const id = "tg_n1001234567890_7";
+  const media = createMediaToken(id, key, 60, 1_000_000);
+  const art = createArtToken(id, key, 60, 1_000_000);
+  const live = 1_010_000; // inside both tokens' exp
+  const mediaPayload = media.slice(0, media.indexOf("."));
+  const artPayload = art.slice(0, art.indexOf("."));
+  // The M7.6 critical: any non-32-byte signature used to be padded into an
+  // all-zero pair, so timingSafeEqual compared identical buffers and passed.
+  for (const len of [0, 1, 31, 33]) {
+    const forgedSig = Buffer.alloc(len, 0xab).toString("base64url");
+    assert.equal(verifyMediaToken(`${mediaPayload}.${forgedSig}`, key, live), null, `media ${len}-byte sig`);
+    assert.equal(verifyArtToken(`${artPayload}.${forgedSig}`, key, live), null, `art ${len}-byte sig`);
+  }
+  // A tampered payload carrying the ORIGINAL signature must also fail.
+  const forge = (orig: string, idNext: string): string => {
+    const [payload, sig] = [orig.slice(0, orig.indexOf(".")), orig.slice(orig.indexOf(".") + 1)];
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
+    const nextPayload = Buffer.from(JSON.stringify({ ...parsed, id: idNext }), "utf8").toString("base64url");
+    return `${nextPayload}.${sig}`;
+  };
+  assert.equal(verifyMediaToken(forge(media, "tg_n1001234567890_8"), key, live), null);
+  assert.equal(verifyArtToken(forge(art, "tg_n1001234567890_8"), key, live), null);
+});
+
 /* ------------------------------------------------- schema migration v1→v2 */
 
 test("db: schema v1 databases gain hasThumb on open (ALTER + version 3)", () => {

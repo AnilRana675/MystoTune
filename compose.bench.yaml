@@ -33,7 +33,7 @@ services:
       - -c
       - node dist/scripts/seed-fixture.js && exec node dist/src/server.js
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>r.json()).then(j=>process.exit(j.ok&&j.indexCount>=6?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/'+process.env.ADDON_SECRET+'/status').then(r=>r.json()).then(j=>process.exit(j.ok&&j.indexCount>=6?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 10

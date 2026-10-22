@@ -37,7 +37,7 @@ const NOISE_TAGS: RegExp[] = [
   /\u2026/g,
 ];
 
-const KNOWN_EXT = /\.(flac|mp3|wav|m4a|aac|ogg|opus|alac|aiff|wma)$/i;
+const KNOWN_EXT = /\.(flac|mp3|wav|m4a|aac|ogg|opus|alac|aiff|aif|wma)$/i;
 
 /**
  * §4.14 rules: strip ext, underscores -> spaces, drop leading numbers,
@@ -124,6 +124,8 @@ const KNOWN_TYPES: Record<string, AudioDescriptor> = {
   "audio/x-flac": { codec: "flac", container: "flac", lossless: true, bitrateKbps: null },
   "audio/wav": { codec: "pcm", container: "wav", lossless: true, bitrateKbps: null },
   "audio/x-wav": { codec: "pcm", container: "wav", lossless: true, bitrateKbps: null },
+  "audio/aiff": { codec: "pcm", container: "aiff", lossless: true, bitrateKbps: null },
+  "audio/x-aiff": { codec: "pcm", container: "aiff", lossless: true, bitrateKbps: null },
   "audio/mp4": { codec: "aac", container: "mp4", lossless: false, bitrateKbps: null },
   "audio/x-m4a": { codec: "aac", container: "mp4", lossless: false, bitrateKbps: null },
   "audio/aac": { codec: "aac", container: "aac", lossless: false, bitrateKbps: null },
@@ -142,7 +144,8 @@ const EXT_TYPES: Record<string, AudioDescriptor> = {
   opus: KNOWN_TYPES["audio/opus"]!,
   // ALAC is detectable only by probing (FR-13/M4); until then .m4a stays aac.
   alac: { codec: "alac", container: "m4a", lossless: true, bitrateKbps: null },
-  aiff: { codec: "pcm", container: "aiff", lossless: true, bitrateKbps: null },
+  aiff: KNOWN_TYPES["audio/aiff"]!,
+  aif: KNOWN_TYPES["audio/aiff"]!,
 };
 
 export function audioDescriptor(
@@ -183,7 +186,17 @@ export function audioQuality(d: AudioDescriptor): AudioQuality {
 
 /** "format" per row/spec examples: codec when known, else ext, else mime subtype, else container. */
 export function formatOf(d: AudioDescriptor, fileName: string | null | undefined, mime: string | null | undefined): string | null {
-  if (d.codec) return d.codec;
+  if (d.codec) {
+    // PCM rows are labelled by their container: BitChord treats "pcm" as an
+    // unknown codec and falls back to the container anyway — advertise
+    // "wav"/"aiff" so the format is meaningful to clients that read it (§4.3).
+    if (d.codec.toLowerCase() === "pcm") {
+      const ext = fileName?.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase();
+      if (d.container === "wav" || ext === "wav") return "wav";
+      if (d.container === "aiff" || ext === "aiff" || ext === "aif") return "aiff";
+    }
+    return d.codec;
+  }
   if (fileName) {
     const ext = fileName.match(/\.([a-z0-9]{2,5})$/i)?.[1]?.toLowerCase();
     if (ext) return ext;
@@ -249,7 +262,7 @@ export function docIdFromLong(id: string | number | null | undefined): number {
 /** mime or file extension qualifies the doc as audio post-filter material (§4.6). */
 export function looksLikeAudio(mime: string | null | undefined, fileName: string | null | undefined): boolean {
   if (mime && (mime === "audio/mpeg" || mime.startsWith("audio/"))) return true;
-  if (fileName && /\.(flac|mp3|wav|m4a|aac|ogg|opus|alac|aiff|wma)$/i.test(fileName)) return true;
+  if (fileName && KNOWN_EXT.test(fileName)) return true;
   return false;
 }
 

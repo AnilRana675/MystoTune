@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { upsertTrack } from "../src/db.js";
 import { buildTestServer, TEST_SECRET, fetchJson, type TestServer } from "./util.js";
-import { audioDescriptor } from "../src/indexer.js";
+import { audioDescriptor, looksLikeAudio } from "../src/indexer.js";
 
 let ts: TestServer;
 const S = TEST_SECRET;
@@ -103,4 +103,31 @@ test("urlencoded ampersand + brackets are safe", async () => {
   assert.equal(res.status, 200);
   const rows = (await res.json() as any).tracks as Array<{ title: string }>;
   assert.ok(rows.some((r) => /hum lapel/i.test(r.title)), JSON.stringify(rows));
+});
+
+test("audioDescriptor: AIFF variants are lossless PCM with no size-derived bitrate", () => {
+  // Regression: .aif and MIME-only AIFF used to fall through to the unknown
+  // branch, which fabricated a bitrate from size×8/duration and labelled the
+  // row HIGH/Lossy. All AIFF spellings must resolve to lossless PCM instead.
+  for (const [mime, name] of [
+    ["audio/aiff", "Track.aif"],
+    ["audio/x-aiff", "Track.aif"],
+    ["application/octet-stream", "Track.aif"],
+    ["application/octet-stream", "Track.aiff"],
+  ] as const) {
+    const d = audioDescriptor(mime, name, 4_000_000, 30);
+    assert.equal(d.lossless, true, `${mime}/${name}: lossless`);
+    assert.equal(d.codec, "pcm", `${mime}/${name}: codec`);
+    assert.equal(d.container, "aiff", `${mime}/${name}: container`);
+    assert.equal(d.bitrateKbps, null, `${mime}/${name}: no fake bitrate`);
+  }
+  // Lossy behaviour stays exactly as verified: the estimate is still supplied.
+  const mp3 = audioDescriptor("audio/mpeg", "x.mp3", 4_000_000, 30);
+  assert.equal(mp3.lossless, false);
+  assert.equal(mp3.bitrateKbps, 1067);
+});
+
+test("looksLikeAudio: .aif docs are indexable audio", () => {
+  assert.equal(looksLikeAudio("application/octet-stream", "Track.aif"), true);
+  assert.equal(looksLikeAudio(null, "Track.aiff"), true);
 });

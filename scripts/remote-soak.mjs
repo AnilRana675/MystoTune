@@ -121,7 +121,7 @@ let samplerStop = false;
 async function healthSampler() {
   while (!samplerStop) {
     try {
-      const h = await (await fetch(`${base}/healthz`)).json();
+      const h = await (await fetch(`${base}/${secret}/status`)).json();
       summary.maxRssKiB = Math.max(summary.maxRssKiB, h.rss ?? 0);
       summary.maxHeapUsedKiB = Math.max(summary.maxHeapUsedKiB, h.heapUsed ?? 0);
       summary.maxActive = Math.max(summary.maxActive, h.activeStreams ?? 0);

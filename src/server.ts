@@ -194,7 +194,9 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     let p = raw;
     const sIdx = p.indexOf(`/${cfg.addonSecret}`);
     if (sIdx >= 0) p = p.slice(0, sIdx + 1) + "<secret>" + p.slice(sIdx + cfg.addonSecret.length + 1);
-    return p.replace(/\/media\/([^.]+)\.?([^./]*)/, "/media/<token>");
+    return p
+      .replace(/\/media\/([^.]+)\.?([^./]*)/, "/media/<token>")
+      .replace(/\/art\/([^.]+)\.?([^./]*)/, "/art/<token>");
   };
   let reqSeq = 0;
   app.addHook("onRequest", async (req) => {
@@ -391,6 +393,9 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
       quality: qualityLabel(d),
       codec: d.codec ?? undefined,
       container: d.container ?? undefined,
+      // M7.7: protocol bitrate is bits/s; the index stores kbps. Absent stays
+      // absent so BitChord falls back to the requested tier (source-verified).
+      bitrate: row.bitrateKbps ? row.bitrateKbps * 1000 : undefined,
       manifest: "none",
       encrypted: false,
     });
