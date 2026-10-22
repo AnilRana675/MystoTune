@@ -42,9 +42,10 @@ export function verifyMediaToken(token: string | undefined, key: Buffer, nowMs: 
   // constant-time signature check over the exact payload bytes
   const expected = createHmac("sha256", key).update(payload).digest();
   const given = Buffer.from(sig, "base64url");
-  const a = expected.length === given.length ? expected : Buffer.alloc(Math.max(expected.length, given.length));
-  const b = expected.length === given.length ? given : a;
-  if (!timingSafeEqual(a, b)) return null;
+  // A forged/truncated signature must never reach timingSafeEqual with a
+  // length-padded buffer (pre-M7.6 bug: equal exemplars let it pass).
+  if (given.length !== expected.length) return null;
+  if (!timingSafeEqual(expected, given)) return null;
 
   let parsed: unknown;
   try {
@@ -95,9 +96,10 @@ export function verifyArtToken(token: string | undefined, key: Buffer, nowMs: nu
   if (payloadBytes.length === 0 || payloadBytes.length > 512) return null;
   const expected = createHmac("sha256", key).update(payload).digest();
   const given = Buffer.from(sig, "base64url");
-  const a = expected.length === given.length ? expected : Buffer.alloc(Math.max(expected.length, given.length));
-  const b = expected.length === given.length ? given : a;
-  if (!timingSafeEqual(a, b)) return null;
+  // A forged/truncated signature must never reach timingSafeEqual with a
+  // length-padded buffer (pre-M7.6 bug: equal exemplars let it pass).
+  if (given.length !== expected.length) return null;
+  if (!timingSafeEqual(expected, given)) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(payloadBytes.toString("utf8"));
