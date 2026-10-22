@@ -50,7 +50,7 @@ with a banner. Details in `docs/render.md`.
 
 Plain words work exactly as before — the grammar is opt-in:
 
-- `artist:m83` / `album:hurry` / `title:'day glow'` — field scoping
+- `artist:m83` / `album:hurry` / `title:"day glow"` — field scoping
   (single word = prefix match; quotes = exact phrase in that field);
 - `"midnight city"` — quoted phrase, word order matters;
 - `lossless` — only lossless results (FLAC/ALAC);
@@ -61,7 +61,7 @@ Plain words work exactly as before — the grammar is opt-in:
 
 Combine freely: `artist:m83 lossless`, `title:'skinny love' dur:<200`,
 `recent:2 sort:recent`. Unknown prefixes degrade back to plain text.
-The last 10 queries show up in `/healthz` as `lastSearches` — handy to
+The last 10 queries show up in `/{secret}/status` as `lastSearches` — handy to
 confirm what BitChord actually sent.
 
 ## Local development

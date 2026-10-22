@@ -32,7 +32,7 @@ async function waitReady(deadlineMs) {
   const end = Date.now() + deadlineMs;
   while (Date.now() < end) {
     try {
-      const res = await fetch(`${BASE}/healthz`);
+      const res = await fetch(`${BASE}/${SECRET}/status`);
       const j = await res.json();
       if (j.ok === true && j.indexCount >= 6) return true;
     } catch {
