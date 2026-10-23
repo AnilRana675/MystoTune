@@ -183,6 +183,26 @@ export function countTracks(db: Database.Database): number {
   return row.n;
 }
 
+/** M7.9: per-channel + total library byte size (one GROUP BY pass, opt-in via
+ * TRACK_SIZE_STATS — /status only reads it when cfg.trackSizes is true). */
+export interface ChannelSize {
+  chatId: number;
+  count: number;
+  bytes: number;
+}
+
+export function channelSizes(db: Database.Database): { totalBytes: number; byChannel: ChannelSize[] } {
+  const rows = db
+    .prepare("SELECT chatId, COUNT(*) AS count, SUM(size) AS bytes FROM tracks GROUP BY chatId ORDER BY bytes DESC")
+    .all() as Array<{ chatId: number | string; count: number; bytes: number | null }>;
+  const byChannel: ChannelSize[] = rows.map((r) => ({
+    chatId: Number(r.chatId),
+    count: Number(r.count),
+    bytes: Number(r.bytes ?? 0),
+  }));
+  return { totalBytes: byChannel.reduce((sum, r) => sum + r.bytes, 0), byChannel };
+}
+
 /* ---------------------------------------------------------------- cursors (FR-14) */
 
 /** Oldest-rowids list used to trim `tracks` down to MAX_INDEX_ENTRIES (§4.6, keep newest). */

@@ -250,6 +250,13 @@ iberately not built: full status page = the `/status`
   fallback, and the one-time setup link in the deploy log is a known
   sensitivity (rotate `ADDON_SECRET` after setup if needed).
 
+- **M7.9 ✅ library byte sizes on /status (opt-in env)** — `TRACK_SIZE_STATS=1`
+  makes `/{secret}/status` report `totalBytes` plus a per-channel
+  `{chatId, count, bytes}` breakdown (`byChannel`), answering "how big is the
+  music on this channel" with one SQLite `GROUP BY chatId` pass. Default off:
+  absent keys keep the status payload lean on big libraries; values stay out
+  of the config store (env wins, §7.3).
+
 ## Open drills (manual acceptance on Render)
 
 - [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)
