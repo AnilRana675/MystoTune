@@ -1,0 +1,23 @@
+# secrets — NEVER commit (live Telegram session, signing keys, Redis URL)
+.env
+.env.*
+!.env.example
+
+# runtime state (live SQLite index, WAL files)
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# build output + deps
+node_modules/
+dist/
+coverage/
+
+# generated synthetic audio (rebuilt via npm run seed)
+test/fixtures/generated/
+
+# misc
+*.log
+*.tsbuildinfo
+.DS_Store
