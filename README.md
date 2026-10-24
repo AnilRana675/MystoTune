@@ -133,6 +133,13 @@ aborts the pipeline, and the file DC is kept warm. The first chunk is fetched
 *before* the HTTP headers are committed, so cold/FloodWait/expired-reference
 failures surface as real 503/429/404 instead of a connect-then-truncate.
 
+## Self-hosting (your own server, auto-deploy on push)
+
+Docker Compose + GitHub Actions SSH deploy: push to `main` → CI gate → server
+pulls, rebuilds, health-checks. nginx/Caddy front it with TLS; no Redis needed
+(disk persists); per-IP rate limits keep working behind a proxy
+(`trustProxy` is enabled). Full guide: **[docs/selfhost.md](docs/selfhost.md)**.
+
 ## Tests & soak
 
 ```bash

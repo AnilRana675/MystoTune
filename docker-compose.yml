@@ -1,0 +1,16 @@
+# MystoTune self-host (docs/selfhost.md): nginx terminates TLS and proxies to
+# the loopback-only port below. `.env` and `./data` live on the server only —
+# they are untracked, so `git reset --hard` in the deploy script never touches
+# them. Keep PORT=10000 in .env in sync with the host-side port mapping.
+services:
+  mystotune:
+    build: .
+    container_name: mystotune
+    ports:
+      - "127.0.0.1:10000:10000"
+    volumes:
+      - ./data:/data
+    env_file: .env
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: "1.0"
