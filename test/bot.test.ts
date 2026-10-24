@@ -331,7 +331,9 @@ test("B1 end-to-end v2: variant card pushes per-copy buttons; tapped copy delete
 
     await bot.handleUpdate(tap("dupe:-100555:3:2:keep"));
     assert.equal(deletions.length, 1, "keep tap deletes nothing");
-    assert.ok(transport.edits.at(-1)?.text.startsWith("🫶"), "keep receipt");
+    // the purge already dropped msg 2 from the index, so only one "copy" is
+    // left — nothing forms a set anymore: the old card answers gracefully
+    assert.ok(transport.edits.at(-1)?.text.startsWith("🫥"), "set already settled — nothing to keep");
 
     await bot.handleUpdate(tap("dupe:-100555:9:8:del"));
     assert.ok(transport.edits.at(-1)?.text.startsWith("🫥"), "vanished group receipt");
@@ -370,6 +372,11 @@ test("B1 copies e2e: byte-twin set per-copy deletes down to one, then records th
     // tap #1 → card re-renders with 2 remaining copies and fresh buttons
     await bot.handleUpdate(tap("dupe:-100555:2:del"));
     assert.deepEqual(deletions.at(-1), { chatId: -100555, msgIds: [2] });
+    // M7.14: the deleted copy's index row is purged immediately, not "next sync"
+    const msg2Rows = db
+      .prepare("SELECT COUNT(*) AS n FROM tracks WHERE chatId = ? AND msgId = ?")
+      .get(-100555, 2) as unknown as { n: number };
+    assert.equal(msg2Rows.n, 0, "deleted copy's index row purged on tap");
     const edit1 = transport.edits.at(-1)!;
     assert.ok(edit1.text.includes("Duplicate copies (2)"), "card self-edits");
     assert.equal(
@@ -382,9 +389,9 @@ test("B1 copies e2e: byte-twin set per-copy deletes down to one, then records th
     await bot.handleUpdate(tap("dupe:-100555:3:del"));
     assert.deepEqual(deletions.at(-1), { chatId: -100555, msgIds: [3] });
     assert.equal(
-      decidedReview(db, "dupe:-100555:4:2"),
+      decidedReview(db, "dupe:-100555:4:3"),
       "delete",
-      "set finalized under its review id once a single copy remains",
+      "set finalized under its review id once a single copy remains (purged copies leave the recomputed id)",
     );
     // the settled card cleared its keyboard — a stale per-copy tap retried
     // against the live index is answered harmlessly (index lags reality)

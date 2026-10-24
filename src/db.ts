@@ -163,6 +163,23 @@ export function removeTracksByRowids(db: Database.Database, rowids: Array<number
   run(rowids.map(Number));
 }
 
+/** M7.14: the bot deletes via the logged-in user session; cursor syncs only
+ * ever see NEW messages (a deleted one is re-seen by nobody), so the bot drops
+ * the now-stale index rows itself instead of waiting for the next reconcile. */
+export function deleteTracksByMsg(db: Database.Database, chatId: number, msgIds: number[]): number {
+  const stmt = db.prepare("SELECT rowid FROM tracks WHERE chatId = @chatId AND msgId = @msgId");
+  const run = db.transaction((ids: number[]) => {
+    const rowids: number[] = [];
+    for (const msgId of ids) {
+      const hits = stmt.all({ chatId, msgId }) as Array<{ rowid: number | bigint }>;
+      for (const r of hits) rowids.push(Number(r.rowid));
+    }
+    if (rowids.length > 0) removeTracksByRowids(db, rowids);
+    return rowids.length;
+  });
+  return run(msgIds);
+}
+
 /** List every track (bounded batches) for the M1 reconcile sweep. */
 export function listTrackIds(db: Database.Database, offset: number, limit: number): Array<{ rowid: number; id: string }> {
   const rows = stmts(db).listIds.all({ offset, limit }) as Array<{ rowid: number; id: string }>;

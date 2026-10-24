@@ -142,6 +142,8 @@ interface LoopHarness {
   db: ReturnType<typeof openDb>;
   indexer: IndexIndexer;
   warnings: string[];
+  fake: unknown;
+  cfg: AppConfig;
   list: (msgs: RawDocMessage[]) => void;
   setExists: (missingMsgIds: number[]) => void;
   cleanup: () => void;
@@ -176,6 +178,8 @@ function loopHarness(cfgOver: Partial<AppConfig> = {}): LoopHarness {
     db,
     indexer,
     warnings,
+    fake,
+    cfg,
     list: (msgs) => {
       script = msgs;
     },
@@ -231,6 +235,37 @@ test("reconcile removes deleted rows in batches of 100", async () => {
     assert.equal(countTracks(h.db), 118);
     assert.equal(getTrack(h.db, "tg_n1001234567890_5"), null);
     assert.equal(getTrack(h.db, "tg_n1001234567890_117"), null);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("boot reconcile reaps deletions shortly after start() (M7.14)", async () => {
+  const h = loopHarness();
+  try {
+    h.list([rawFor(1), rawFor(2)]);
+    await h.indexer.syncOnce();
+    assert.equal(countTracks(h.db), 2);
+
+    // msgId 1 deleted in the channel (outside the bot — app-side delete)
+    h.setExists([1]);
+    const booted = new IndexIndexer(
+      h.db,
+      h.fake as TelegramManager,
+      h.cfg,
+      (m: string) => void h.warnings.push(m),
+      null,
+      undefined,
+      10, // 10 ms boot delay — reaps without waiting the interval hours
+    );
+    booted.start();
+    try {
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(countTracks(h.db), 1, "deleted track reaped right after boot");
+      assert.ok(booted.lastReconcileAt > 0);
+    } finally {
+      booted.stop();
+    }
   } finally {
     h.cleanup();
   }

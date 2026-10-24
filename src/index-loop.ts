@@ -92,6 +92,7 @@ export class IndexIndexer {
 
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private reconcileTimer: ReturnType<typeof setInterval> | null = null;
+  private reconcileBoot: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
 
   constructor(
@@ -103,6 +104,9 @@ export class IndexIndexer {
     /** M7.11-B5: fired once per sync pass with the count of newly added rows
      * (the curation bot uses it to trigger a coalesced sweep). */
     private readonly onNewRows?: (added: number) => void,
+    /** M7.14: first reconcile this long after start() — reaps deletions done
+     * outside the bot without waiting a full interval (default 90 s). */
+    private readonly reconcileBootDelayMs: number = 90_000,
   ) {}
 
   start(): void {
@@ -110,6 +114,14 @@ export class IndexIndexer {
     // first pass shortly after boot so the index is warm without waiting 10 min
     const boot = setTimeout(() => void this.syncOnce().catch(() => undefined), 5000);
     boot.unref?.();
+    // M7.14: cursor syncs only ever see new messages — deletions wait for a
+    // reconcile, whose first scheduled fire can be hours out. A boot reconcile
+    // cleans the slate on every restart (bot-purge handles its own deletions).
+    this.reconcileBoot = setTimeout(
+      () => void this.reconcileOnce().catch(() => undefined),
+      Math.max(10, this.reconcileBootDelayMs),
+    );
+    this.reconcileBoot.unref?.();
     this.syncTimer = setInterval(
       () => void this.syncOnce().catch((e) => undefined),
       Math.max(1, this.cfg.syncIntervalMinutes) * 60_000,
@@ -120,15 +132,16 @@ export class IndexIndexer {
       Math.max(1, this.cfg.reconcileIntervalHours) * 3_600_000,
     );
     this.reconcileTimer.unref?.();
-    void boot;
   }
 
   stop(): void {
     this.stopped = true;
     if (this.syncTimer) clearInterval(this.syncTimer);
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+    if (this.reconcileBoot) clearTimeout(this.reconcileBoot);
     this.syncTimer = null;
     this.reconcileTimer = null;
+    this.reconcileBoot = null;
   }
 
   /* --------------------------------------------------------------- sync */
