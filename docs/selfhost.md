@@ -112,4 +112,5 @@ NODE_OPTIONS=--max-old-space-size=128) keeps steady-state near ~90 MB RSS.
 | `AUTH_KEY_DUPLICATED` at boot | the session is logged in elsewhere — wizard for a fresh one, or stop the other instance |
 | healthz fails after deploy | script prints the last 60 log lines; usually an env typo — fix `.env`, redeploy |
 | `EACCES` on `/data` | only on machines where `data/` isn't owned by the compose user — `docker compose down && sudo chown -R user . && up` |
+| boot crash-loop `SQLITE_READONLY` | `./data` (or `index.sqlite`) is root-owned from a first `sudo docker compose up`; the deploy's ownership preflight now fails fast with the fix: `sudo chown -R 1000:1000 data` |
 | BitChord can't play | `PUBLIC_BASE_URL` must exactly match the URL BitChord uses to reach the manifest |

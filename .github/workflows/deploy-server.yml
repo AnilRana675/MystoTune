@@ -35,7 +35,7 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           port: ${{ secrets.SSH_PORT || 22 }}
           key: ${{ secrets.SSH_KEY }}
-          script_stop: true
+
           script: |
             cd /opt/mystotune
             bash scripts/selfhost-deploy.sh
