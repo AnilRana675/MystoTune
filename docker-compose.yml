@@ -1,16 +1,37 @@
-# MystoTune self-host (docs/selfhost.md): nginx terminates TLS and proxies to
-# the loopback-only port below. `.env` and `./data` live on the server only —
-# they are untracked, so `git reset --hard` in the deploy script never touches
-# them. Keep PORT=10000 in .env in sync with the host-side port mapping.
+# MystoTune self-host compose (docs/selfhost.md) — the canonical stack.
+# Retires the PRD §4.12 planning compose (auto-pick trap: 8080 healthcheck,
+# no ports). Keeps its production discipline — read-only rootfs with a tmpfs,
+# log rotation, lean threadpool/allocator — on the deployed layout:
+# nginx → 127.0.0.1:$PORT → container; PORT comes from .env (keep =10000).
+# `.env` and `./data` stay server-side & untracked; `git reset --hard` in
+# the deploy script never touches them.
 services:
   mystotune:
     build: .
     container_name: mystotune
+    init: true
+    read_only: true
+    tmpfs: ["/tmp"]
     ports:
-      - "127.0.0.1:10000:10000"
+      - "127.0.0.1:${PORT:-10000}:${PORT:-10000}"
     volumes:
       - ./data:/data
     env_file: .env
+    environment:
+      UV_THREADPOOL_SIZE: "2"
+      MALLOC_ARENA_MAX: "2"
     restart: unless-stopped
     mem_limit: 256m
+    memswap_limit: 384m
     cpus: "1.0"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - node -e "fetch('http://127.0.0.1:'+(process.env.PORT||10000)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
