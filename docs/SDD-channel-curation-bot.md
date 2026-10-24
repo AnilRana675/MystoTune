@@ -11,8 +11,10 @@ which one keep or delete".
 A private, **zero-command** Telegram bot that continuously watches the music
 channel's index and pushes review cards to the owner: junk candidates and
 duplicate groups. Every destructive action waits for a button tap:
-**Delete or Keep** for junk, **"Keep this one"** for duplicate groups
-(deleting the others). The bot never deletes without an explicit tap.
+**Delete or Keep** for junk; for duplicates v2 (M7.13): **per-copy
+`🗑 Delete #N`**, **`Keep all`**, and (same-recording pairs only) a
+**★ Delete all but best** bulk action — variant cards never mass-delete.
+The bot never deletes without an explicit tap.
 
 ## 2. Locked decisions (from the interview)
 
@@ -21,7 +23,7 @@ duplicate groups. Every destructive action waits for a button tap:
 | Surface | **No commands.** Findings are pushed as review cards with inline buttons |
 | Automation | Sweeps run automatically: once at bot start (after the first sync) and then on a fixed interval |
 | Audience | Owner only — `BOT_ALLOWED_IDS` (comma list of Telegram user ids, first id = the chat cards are sent to); strangers' taps/buttons are ignored |
-| Decision UI | Per-card inline keyboards: junk = `Delete` / `Keep`; duplicate group = `Keep #1` / `Keep #2` / `Skip`; every card single-use |
+| Decision UI | Per-card inline keyboards: junk = `Delete` / `Keep`; duplicates v2 (M7.13): copies tier = per-copy `🗑 Delete #N` + `🫶 Keep all` + ★ `Delete all but best`; variant tier (remix/feat/live) = per-copy delete + keep-all only, wording says "separate recordings — usually keep all"; every card single-use, cards self-edit after per-copy taps |
 | Deletion authority | The **user session** (owner's logged-in account in `src/telegram.ts`) performs `deleteMessages`; the bot account only coordinates (bots cannot delete channel messages) |
 | Transport | Bot API HTTPS long polling (outbound-only; no webhook/port/cert; fine on Render free + selfhost) |
 | Dependency budget | Zero new npm deps — raw `fetch` to `https://api.telegram.org/bot<token>/*` |

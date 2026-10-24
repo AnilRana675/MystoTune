@@ -52,7 +52,14 @@ export interface CardKeyboard {
 export interface BotTransport {
   /** Returns the Telegram message id of the sent card (null if unknown). */
   sendCard(chatId: number, text: string, keyboard: CardKeyboard): Promise<number | null>;
-  editMessage(chatId: number, messageId: number, text: string): Promise<void>;
+  /** Edits card text. `keyboard` undefined = leave markup intact (receipts);
+   * null = clear the inline keyboard (finished cards). */
+  editMessage(
+    chatId: number,
+    messageId: number,
+    text: string,
+    keyboard?: CardKeyboard | null,
+  ): Promise<void>;
   /** Always answer taps so Telegram stops the client-side spinner. */
   answerCallback(callbackId: string, text: string): Promise<void>;
   /** Router-only: the long-poll update source. Real = BotApi; fakes may omit
@@ -142,13 +149,69 @@ export function normalizeTitle(title: string): string {
     .trim();
 }
 
+/** DJ-style trailing version markers; dash-form titles only ("Song - Extended
+ * Mix"). Bracket-form extras are captured wholesale, so no list needed there. */
+const DASH_VERSION_RE =
+  /(?:remix|extended|radio|live|acoustic|instrumental|cover|remaster|nightcore|slowed|sped|lo-fi|lofi|bootleg|vip|karaoke|bass|boosted|edit|mix|version|explicit|clean|club|dub|flip|cut)/i;
+
+/** M7.13 v2 (SDD §3): split a raw Telegram title into the song identity and
+ * its version annotation. "Away (feat. X) [HQ] - Extended Mix" →
+ * base "away", extras "feat x hq extended mix". Two files are the SAME
+ * recording only when both parts match (plus duration) — a remix is never
+ * a duplicate of the original. */
+export function splitTitle(raw: string): { base: string; extras: string } {
+  let rest = String(raw ?? "");
+  const parts: string[] = [];
+  rest = rest.replace(/[([{]([^)\]}]*)[)\]}]/g, (_m: string, inner: string) => {
+    parts.push(inner); // the CONTENT, not the brackets — normalizeTitle would eat both
+    return " "; // keep spacing so base text around brackets stays separated
+  });
+  const ft = /(?:\bfeaturing\b|\bfeats?\b|\bft\b)[.:\s]+(.+)$/i.exec(rest);
+  if (ft?.[1] !== undefined) {
+    parts.push(ft[1]);
+    rest = rest.slice(0, ft.index);
+  } else {
+    const dash = /^(.+?)\s+[-–—]\s+(.+)$/.exec(rest);
+    if (dash?.[2] !== undefined && DASH_VERSION_RE.test(dash[2])) {
+      parts.push(dash[2]);
+      rest = dash[1] ?? rest;
+    }
+  }
+  return { base: normalizeTitle(rest), extras: normLoose(parts.join(" ")) };
+}
+
+/** normalizeTitle minus the feat-tail stripper — the extras text IS the feat
+ * annotation; stripping it would collapse every "(feat. X)" back to "". */
+const normLoose = (s: string): string =>
+  s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+/** Durations this close read as the same take (radio edits usually shorter).
+ * Telegram audio always carries a duration; null is metadata damage. */
+const DURATION_SAME_SEC = 3;
+
+/** Same-take proof: byte-identical uploads (mime+size, any titles), or same
+ * base + same version annotation + near-equal duration. */
+export function sameTake(a: ScanRow, b: ScanRow): boolean {
+  if ((a.mime ?? "") === (b.mime ?? "") && a.size !== null && a.size === b.size) return true;
+  const { extras: ea } = splitTitle(a.title);
+  const { extras: eb } = splitTitle(b.title);
+  if (ea !== eb) return false;
+  if (a.duration === null && b.duration === null) return true;
+  if (a.duration === null || b.duration === null) return false;
+  return Math.abs(a.duration - b.duration) <= DURATION_SAME_SEC;
+}
+
 export interface DupeGroup {
-  /** `dupe:{chatId}:{bestMsgId}:{smallestMember}` — one row can sit in two
-   * rule clusters, so best-msgId alone is not unique per card. */
+  /** `dupe:{chatId}:{bestMsgId}:{smallestMember}` — stable review id (old
+   * cards' bulk buttons and tap-time recompute both key on this). */
   id: string;
   chatId: number;
+  /** M7.13 v2: "copies" = same recording (byte twins / same version+dur);
+   * "variant" = same song, different recording (remix/feat/live) — per-copy
+   * delete only, never mass-delete. */
+  kind: "copies" | "variant";
   members: ScanRow[]; // ordered by msgId ascending
-  best: ScanRow; // suggested keeper (SDD §3: lossless first, then biggest file)
+  best: ScanRow; // keeper hint (lossless first); for variants: quality pick
 }
 
 /** Deterministic keeper: lossless wins, then largest file, then newest message. */
@@ -162,10 +225,11 @@ export function pickBest(members: ScanRow[]): ScanRow {
   })[0] as ScanRow;
 }
 
-/** SDD §3 duplicate rules: same (artist, normalized title) OR exact
- * (mime, size) twins. A row's two keys live in ONE cluster — the O(1) key→
- * cluster map unions the pair when they differ (gate-2: the old linear
- * `hits` scan never fired, and a both-rules pair yielded two cards). */
+/** SDD §3 v2: cluster by artist + base title, bridged by byte-twin uploads
+ * (same mime+size). Inside a cluster, `sameTake` chains tell real duplicates
+ * (one chain → kind "copies") from version variants (≥2 chains → kind
+ * "variant": same song, remix/feat/live recordings — safe, per-copy only).
+ * Outer clustering stays the O(1) key→cluster union (gate-2). */
 export function dupeGroups(rows: ScanRow[]): DupeGroup[] {
   const byChat = new Map<number, ScanRow[]>();
   for (const r of rows) {
@@ -175,6 +239,16 @@ export function dupeGroups(rows: ScanRow[]): DupeGroup[] {
     byChat.set(r.chatId, list);
   }
   const out: DupeGroup[] = [];
+  const fmtGroup = (chatId: number, rows: ScanRow[], kind: "copies" | "variant"): DupeGroup => {
+    const best = pickBest(rows);
+    return {
+      id: `dupe:${chatId}:${best.msgId}:${rows[0]?.msgId}`,
+      chatId,
+      kind,
+      members: rows,
+      best,
+    };
+  };
   for (const [chatId, list] of byChat) {
     interface Cluster {
       seen: Set<string>;
@@ -183,7 +257,8 @@ export function dupeGroups(rows: ScanRow[]): DupeGroup[] {
     const clusters: Cluster[] = [];
     const owner = new Map<string, Cluster>();
     for (const r of list) {
-      const tk = `t:${r.artist ?? ""}|${normalizeTitle(r.title)}`;
+      const { base } = splitTitle(r.title);
+      const tk = `t:${r.artist ?? ""}|${base}`;
       const sk = `s:${r.mime ?? ""}|${r.size}`;
       const tC = owner.get(tk);
       const sC = owner.get(sk);
@@ -209,32 +284,114 @@ export function dupeGroups(rows: ScanRow[]): DupeGroup[] {
     }
     for (const c of clusters) {
       if (c.rows.length < 2) continue;
+      // same-take chains within this (small) cluster — pair scan is fine
+      const parent = new Map<number, number>();
+      for (let i = 0; i < c.rows.length; i++) parent.set(i, i);
+      const find = (x: number): number => {
+        let cur = x;
+        while (parent.get(cur) !== cur) cur = parent.get(cur) as number;
+        return cur;
+      };
+      const union = (a: number, b: number): void => {
+        const ra = find(a);
+        const rb = find(b);
+        if (ra !== rb) parent.set(rb, ra);
+      };
+      for (let i = 0; i < c.rows.length; i++) {
+        for (let j = i + 1; j < c.rows.length; j++) {
+          const ri = c.rows[i];
+          const rj = c.rows[j];
+          if (ri && rj && sameTake(ri, rj)) union(i, j);
+        }
+      }
+      const chainList: ScanRow[][] = [];
+      const byRoot = new Map<number, ScanRow[]>();
+      for (let i = 0; i < c.rows.length; i++) {
+        const ri = c.rows[i];
+        if (!ri) continue;
+        const root = find(i);
+        const arr = byRoot.get(root);
+        if (arr) arr.push(ri);
+        else {
+          const fresh: ScanRow[] = [ri];
+          byRoot.set(root, fresh);
+          chainList.push(fresh);
+        }
+      }
       c.rows.sort((a, b) => a.msgId - b.msgId);
-      const best = pickBest(c.rows);
-      out.push({
-        id: `dupe:${chatId}:${best.msgId}:${c.rows[0]?.msgId}`,
-        chatId,
-        members: c.rows,
-        best,
-      });
+      out.push(fmtGroup(chatId, c.rows, chainList.length === 1 ? "copies" : "variant"));
     }
   }
-  return out.sort((a, b) => a.chatId - b.chatId || a.best.msgId - b.best.msgId);
+  return out.sort(
+    (a, b) =>
+      a.chatId - b.chatId ||
+      (a.kind === b.kind ? a.best.msgId - b.best.msgId : a.kind === "copies" ? -1 : 1),
+  );
 }
 
-/** Plain-text card body: members listed, keeper starred. */
+/** Card length caps: per-copy delete buttons stop at 6 (huge sets get the
+ * ★ bulk + Keep-all), text stays readable. */
+const MAX_PER_COPY_BUTTONS = 6;
+
+const fmtDur = (sec: number): string => {
+  const m = Math.floor(sec / 60);
+  return `${m}:${String(Math.round(sec % 60)).padStart(2, "0")}`;
+};
+
+/** Plain-text card body: EVERY copy listed with its real title (remix/feat
+ * labels included), numbered #N to match the per-copy buttons. Keeper starred. */
 export function dupeCardText(g: DupeGroup): string {
-  return [
-    `👯 Duplicate set (${g.members.length} copies)`,
-    `Title: ${clamp(g.best.title)}`,
-    `Artist: ${g.best.artist === null ? "—" : clamp(g.best.artist)}`,
-    "",
-    ...g.members.map((r) =>
-      `${r.msgId === g.best.msgId ? "★" : "·"} msg ${r.msgId} · ${fmtBytes(r.size ?? 0)} · ${r.mime ?? "?"}${r.lossless === 1 ? " · lossless" : ""}`,
-    ),
-    "",
-    "Delete removes the other copies from your channel via your own logged-in session.",
-  ].join("\n");
+  const body: string[] = [];
+  body.push(
+    g.kind === "copies"
+      ? `👯 Duplicate copies (${g.members.length}) — same song, same version`
+      : `🎵 Versions of one song (${g.members.length}) — remix / feat / live?`,
+  );
+  body.push(`Artist: ${g.best.artist === null ? "—" : clamp(g.best.artist)}`);
+  body.push("");
+  body.push(
+    ...g.members.map((r, i) => {
+      const { extras } = splitTitle(r.title);
+      return [
+        `${r.msgId === g.best.msgId ? "★" : " "} #${i + 1} “${clamp(r.title)}”`,
+        `    ${fmtBytes(r.size ?? 0)} · ${r.duration === null ? "?" : fmtDur(r.duration)} · ${r.mime ?? "?"}${r.lossless === 1 ? " · lossless" : ""}${extras ? ` · ${extras}` : ""} · msg ${r.msgId}`,
+      ].join("\n");
+    }),
+  );
+  body.push("");
+  if (g.kind === "copies") {
+    body.push("Delete removes that copy from your channel via your own logged-in session.");
+    if (g.members.length > MAX_PER_COPY_BUTTONS) {
+      body.push(`(more than ${MAX_PER_COPY_BUTTONS} copies — use ★ Delete-all for the rest)`);
+    }
+  } else {
+    body.push(
+      "Different versions are separate recordings — usually keep all. Delete only a version you truly don't want.",
+    );
+  }
+  return body.join("\n");
+}
+
+/** Inline keyboard for a dupe card: per-copy 🗑 (paired rows), Keep-all,
+ * and the ★ bulk delete for copies-kind only (variants never mass-delete). */
+export function dupeKeyboard(g: DupeGroup): CardKeyboard {
+  const buttons: Array<Array<CardButton>> = [];
+  const cap = Math.min(g.members.length, MAX_PER_COPY_BUTTONS);
+  for (let i = 0; i < cap; i += 2) {
+    const pair = g.members.slice(i, i + 2);
+    buttons.push(
+      pair.map((r, j) => ({
+        text: `🗑 Delete #${i + j + 1}`,
+        data: `dupe:${g.chatId}:${r.msgId}:del`,
+      })),
+    );
+  }
+  const seg = `${g.chatId}:${g.best.msgId}:${g.members[0]?.msgId}`;
+  buttons.push([{ text: "🫶 Keep all", data: `dupe:${seg}:keep` }]);
+  if (g.kind === "copies") {
+    buttons.push([{ text: `🗑 Delete all but ★ (msg ${g.best.msgId})`, data: `dupe:${seg}:del` }]);
+  }
+  return { buttons };
 }
 
 /* ------------------------------------------------------------------ bot core */
@@ -276,6 +433,10 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
   const ownerChat = cfg.bot.allowedIds[0] as number;
   /** Cards pushed this process — pending decisions re-ask after a restart (§5). */
   const asked = new Set<string>();
+  /** M7.13 v2: copies already deleted via taps (per-copy, bulk ★, or junk) —
+   * the SQLite index outlives Telegram deletions (next sync refreshes), so
+   * duplicate sets must stop counting removed copies or they never settle. */
+  const removed = new Set<string>();
   /** gate-2 L2: ids that failed delivery /too many times retire for the run. */
   const attempts = new Map<string, number>();
 
@@ -342,19 +503,12 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
         junk += 1;
       });
     }
-    // B1: duplicate sets after junk, sharing the sweep budget
+    // B1: duplicate sets after junk, sharing the sweep budget — v2 sorts
+    // copies (actionable dupes) before variant alerts; one card per base.
     for (const g of groups) {
       if (junk + dupes >= MAX_CARDS_PER_SWEEP) break;
       if (asked.has(g.id)) continue; // gate-2 C1 belt: both-rules pairs dedupe by id
-      await sendOnce(g.id, dupeCardText(g), {
-        buttons: [[
-          {
-            text: `Delete others (keep msg ${g.best.msgId})`,
-            data: `dupe:${g.chatId}:${g.best.msgId}:${g.members[0]?.msgId}:del`,
-          },
-          { text: "Keep all", data: `dupe:${g.chatId}:${g.best.msgId}:${g.members[0]?.msgId}:keep` },
-        ]],
-      }, () => {
+      await sendOnce(g.id, dupeCardText(g), dupeKeyboard(g), () => {
         dupes += 1;
       });
     }
@@ -374,19 +528,66 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
       return;
     }
     const junkM = /^junk:(-?\d+):(\d+):(del|keep)$/.exec(data);
-    const dupeM = /^dupe:(-?\d+):(\d+):(\d+):(del|keep)$/.exec(data);
-    if (!junkM && !dupeM) {
+    const dupeBulkM = /^dupe:(-?\d+):(\d+):(\d+):(del|keep)$/.exec(data);
+    // M7.13 v2: per-copy delete — `dupe:{chatId}:{targetMsgId}:del`
+    const dupeOneM = /^dupe:(-?\d+):(\d+):del$/.exec(data);
+    if (!junkM && !dupeBulkM && !dupeOneM) {
       await transport.answerCallback(cb.id, "Unknown card.");
       return;
     }
-    const chatId = Number(junkM?.[1] ?? dupeM?.[1]);
-    const msgId = Number(junkM?.[2] ?? dupeM?.[2]); // junk: target msg · dupe: best msg
-    const choice = (junkM ? junkM[3] : dupeM?.[4]) as "del" | "keep";
+    const chatId = Number(junkM?.[1] ?? dupeBulkM?.[1] ?? dupeOneM?.[1]);
+    const msgId = Number(junkM?.[2] ?? dupeBulkM?.[2] ?? dupeOneM?.[2]);
+    const choice = (junkM ? junkM[3] : (dupeBulkM?.[4] ?? "del")) as "del" | "keep";
     const cardId = data.slice(0, data.lastIndexOf(":")); // stable review id (no action suffix)
     let receipt: string;
+    /** Final card state: per-copy v2 re-renders the whole card + keyboard;
+     * older paths paste the receipt over it (markup kept). */
+    let cardText: string | null = null;
+    let cardKeyboard: CardKeyboard | null | undefined; // undefined = leave as-is
     let answer = choice === "keep" ? "Kept" : "Deleting…";
     try {
-      if (!dupeM) {
+      if (dupeOneM) {
+        // SDD §3 v2 per-copy delete: the tapped copy alone. Recompute finds
+        // the group the copy currently belongs to; the card edits itself
+        // until ≤1 copy remains, then the set records "delete" (no re-ask).
+        const target = msgId;
+        answer = "Deleting…";
+        const group = dupeGroups(scanRows()).find((g) => g.members.some((r) => r.msgId === target));
+        const res = await deleter(chatId, [target]);
+        if (res.error !== undefined) {
+          receipt = `⚠️ Could not delete (msg ${target}): ${res.error} — tap again to retry.`;
+        } else {
+          // remembered until the index catches up: deleted copies leave the
+          // group on the NEXT tap too, so a set always settles at ≤1 copy
+          removed.add(`dupe:${chatId}:${target}`);
+          const rest = group
+            ? group.members.filter((r) => !removed.has(`dupe:${chatId}:${r.msgId}`))
+            : [];
+          if (group) {
+            if (rest.length <= 1) recordReview(db, group.id, "delete");
+            receipt =
+              rest.length === 0
+                ? `✅ Deleted msg ${target} — last copy of the set is gone.`
+                : `✅ Deleted msg ${target} — ${rest.length} cop${rest.length === 1 ? "y" : "ies"} remain (card updated).`;
+          } else {
+            receipt = `✅ Deleted msg ${target} (the card no longer matches the index).`;
+          }
+          if (group && rest.length > 1) {
+            // self-editing card: show what remains with matching buttons
+            const next: DupeGroup = { ...group, members: rest, best: pickBest(rest) };
+            cardText = dupeCardText(next);
+            cardKeyboard = dupeKeyboard(next);
+          } else {
+            cardText =
+              rest.length === 1
+                ? `✅ Settled — msg ${rest[0]?.msgId} stays; this set won't ask again.`
+                : `✅ Done — ${
+                    group ? "last copy of the set" : `msg ${target}`
+                  } removed. The next sync refreshes the index.`;
+            cardKeyboard = null; // clears the stale inline keyboard
+          }
+        }
+      } else if (!dupeBulkM) {
         if (choice === "keep") {
           recordReview(db, cardId, "keep");
           receipt = `🫶 Kept “${msgId}” — this card will not come back.`;
@@ -394,6 +595,7 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
           const res = await deleter(chatId, [msgId]);
           if (res.error === undefined) {
             recordReview(db, cardId, "delete");
+            removed.add(`dupe:${chatId}:${msgId}`); // junk dupes stop counting in dupe sets too
             receipt = `✅ Deleted (msg ${msgId}). The next sync refreshes the index.`;
           } else {
             receipt = `⚠️ Could not delete (msg ${msgId}): ${res.error} — it stays queued; the next sweep re-asks.`;
@@ -401,7 +603,7 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
         }
       } else {
         // B1: recompute groups at tap time — the index may have moved; stateless.
-        const dupeMin = Number(dupeM?.[3]);
+        const dupeMin = Number(dupeBulkM[3]);
         const group = dupeGroups(scanRows()).find(
           (g) => g.id === `dupe:${chatId}:${msgId}:${dupeMin}`,
         );
@@ -411,14 +613,19 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
         } else if (choice === "keep") {
           recordReview(db, cardId, "keep");
           receipt = `🫶 Kept the whole set — msg ${group.best.msgId} stays.`;
+        } else if (group.kind === "variant") {
+          // M7.13 v2: variants are separate recordings — per-copy buttons only.
+          answer = "Use per-copy buttons";
+          receipt = `🎵 These are different versions (remix/feat/live) — delete a specific copy above instead of mass-deleting.`;
         } else {
           const others = group.members.map((r) => r.msgId).filter((id) => id !== group.best.msgId);
           const res = await deleter(chatId, others);
           if (res.error === undefined) {
             recordReview(db, cardId, "delete");
+            for (const id of others) removed.add(`dupe:${chatId}:${id}`);
             receipt = `✅ Deleted ${res.deleted} other cop${res.deleted === 1 ? "y" : "ies"} — kept msg ${group.best.msgId} (★). The next sync refreshes the index.`;
           } else {
-            receipt = `⚠️ Could not delete: ${res.error} — tap Delete others again to retry.`;
+            receipt = `⚠️ Could not delete: ${res.error} — tap Delete all but ★ again to retry.`;
           }
         }
       }
@@ -426,7 +633,7 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
       const msgT = cb.message?.message_id;
       if (chatT !== undefined && msgT !== undefined) {
         try {
-          await transport.editMessage(chatT, msgT, receipt);
+          await transport.editMessage(chatT, msgT, cardText ?? receipt, cardKeyboard);
         } catch (e) {
           log(`bot: receipt edit failed (${(e as Error).message})`);
         }
@@ -488,10 +695,17 @@ class BotApi implements BotTransport {
     }).then((r) => r?.message_id ?? null);
   }
 
-  editMessage(chatId: number, messageId: number, text: string): Promise<void> {
-    return this.call("editMessageText", { chat_id: chatId, message_id: messageId, text }).then(
-      () => undefined,
-    );
+  editMessage(
+    chatId: number,
+    messageId: number,
+    text: string,
+    keyboard?: CardKeyboard | null,
+  ): Promise<void> {
+    const body: Record<string, unknown> = { chat_id: chatId, message_id: messageId, text };
+    if (keyboard !== undefined) {
+      body.reply_markup = keyboard ?? { inline_keyboard: [] };
+    }
+    return this.call("editMessageText", body).then(() => undefined);
   }
 
   answerCallback(callbackId: string, text: string): Promise<void> {
