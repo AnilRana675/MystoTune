@@ -40,6 +40,7 @@ import { Lru, TelegramManager, TelegramSourceError, type ArtSource } from "./tel
 import { audioDescriptor, audioQuality, cleanName, formatOf, parseTrackId, qualityLabel } from "./indexer";
 import { probeFirstBytes } from "./probe";
 import { IndexIndexer, restoreSnapshotIfEmpty, waitRedisUp } from "./index-loop";
+import { botHealth, startCurationBot } from "./bot";
 import { openRedisStore, type RedisStore } from "./redis";
 import { renderSetupPage, SetupAccess, SetupError, SetupManager, type LoginFactory, type SetupChannel, type SetupDeps, type SetupLogin } from "./setup";
 import bigInt from "big-integer"; // gramJS BigInteger for the setup login adapter
@@ -747,6 +748,8 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
         docEntries: runtime.telegram.resolvedDocs.size,
         queryEntries: redisStore ? redisStore.queryEntryCount() : 0,
       },
+      // M7.11-B3: bot health surfaces only when the curation bot is on
+      bot: cfg.bot.enabled ? { ...botHealth, cronSec: cfg.bot.sweepSeconds } : undefined,
       counters: {
         searches: metrics.searches,
         streams: metrics.streamResolves,
@@ -1335,6 +1338,20 @@ export async function main(): Promise<void> {
   let draining = false;
   // Re-read the mode cell through a call so TS narrowing can't assume it is
   // stable across awaits (the lease loop and the drain handler mutate it).
+  // SDD-channel-curation-bot §2: zero-command owner janitor — additive,
+  // optional (no token/id env → null), and its failures never touch boot.
+  const curationBot = startCurationBot({
+    cfg,
+    db,
+    deleter: (chatId, msgIds) =>
+      cfg.telegram.channels.includes(chatId)
+        ? telegram.deleteChannelMessages(chatId, msgIds)
+        : Promise.resolve({ deleted: 0, error: "chat not indexed" }),
+    log: (line) => app.log.info(line),
+    // gate-2 H2: only the lease-holding (ACTIVE) instance curates — standby
+    // replicas running main() must not long-poll the same BOT_TOKEN.
+    active: () => modeBox.mode === "active",
+  });
   /** STANDBY → ACTIVE: connect Telegram (overlap-retry), then start indexing.   * Reads runtime.* — the M6.2 finish flow replaces the manager before the
    * first goActive() under SETUP boot. */
   const goActive = async (): Promise<void> => {
@@ -1411,6 +1428,7 @@ export async function main(): Promise<void> {
     };
     while (activeStreams() > 0 && Date.now() < deadline) await delayMs(100);
     await drainingSetup();
+    curationBot?.stop(); // SDD §2: the poll loop dies with the process
     await runtime.telegram.stop();
     if (lease) await lease.release(); // compare-and-delete only our own slot
     await app.close();

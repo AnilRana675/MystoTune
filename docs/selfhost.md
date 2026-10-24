@@ -114,3 +114,4 @@ NODE_OPTIONS=--max-old-space-size=128) keeps steady-state near ~90 MB RSS.
 | `EACCES` on `/data` | only on machines where `data/` isn't owned by the compose user — `docker compose down && sudo chown -R user . && up` |
 | boot crash-loop `SQLITE_READONLY` | `./data` (or `index.sqlite`) is root-owned from a first `sudo docker compose up`; the deploy's ownership preflight now fails fast with the fix: `sudo chown -R 1000:1000 data` |
 | BitChord can't play | `PUBLIC_BASE_URL` must exactly match the URL BitChord uses to reach the manifest |
+| curation bot silent | `BOT_TOKEN`/`BOT_ALLOWED_IDS` missing or a pre-0.7.11 image — check `/{secret}/status` → `bot.*`; the poll loop exits only when disabled |

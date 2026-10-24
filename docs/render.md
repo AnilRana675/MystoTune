@@ -92,6 +92,7 @@ env vars and should not be pasted into the dashboard:
 | `PORT` / `RENDER_EXTERNAL_URL` | injected by Render | Server binds `0.0.0.0`; the external URL feeds `PUBLIC_BASE_URL`; `PROFILE` autodetects `render` |
 | `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` / `TELEGRAM_SESSION` | via the wizard | Alternative: set as env for pre-configured boots (M5 style) — wizard then never opens |
 | channels / options (`MONTHLY_BYTES_BUDGET`, `ALLOW_DOWNLOADS`) | via the wizard | Or set as env — env wins over the store (§7.3) |
+| curation bot (`BOT_TOKEN`, `BOT_ALLOWED_IDS`, `BOT_SWEEP_SECONDS`) | via env only | Empty token/ids = bot off (additive, §7.3-style; first allowed id is the cards chat; sweep interval 60 s–7 d, default daily) |
 | `REDIS_SNAPSHOT` | `1` | index dump after each sync; replayed on cold boot |
 | `LEASE_TTL_MS` / `LEASE_RENEW_MS` / `LEASE_POLL_MS` / `DRAIN_MS` | profile defaults (45/15/5 s, 10 s) | Tune only if you know why |
 | `SETUP_ENABLED` | `auto` — on while unconfigured | `off` 404s every setup route without deleting the wizard |

@@ -613,6 +613,31 @@ export class TelegramManager {
     };
   }
 
+  /** Bot curation (SDD §2): delete channel messages through the OWNER session.
+   * Never throws — returns a typed result the bot renders into a receipt. */
+  async deleteChannelMessages(
+    chatId: number,
+    msgIds: number[],
+  ): Promise<{ deleted: number; error?: string }> {
+    if (msgIds.length === 0) return { deleted: 0 };
+    if (this.state !== "ready" || this.client === null) {
+      return { deleted: 0, error: `telegram ${this.state}` };
+    }
+    try {
+      const res = await this.client.deleteMessages(chatId, msgIds, { revoke: true });
+      // gramJS returns one AffectedMessages per <=100-id chunk — sum pid counts,
+      // not array length (gate-2: receipts must report real message counts).
+      const n = Array.isArray(res)
+        ? (res as Array<{ ptsCount?: number }>).reduce((s, r) => s + (r?.ptsCount ?? 0), 0)
+        : 0;
+      return { deleted: n };
+    } catch (e) {
+      const msg = (e as { errorMessage?: string; message?: string }).errorMessage
+        ?? (e as Error).message ?? "error";
+      return { deleted: 0, error: msg };
+    }
+  }
+
   /** reconcile helper (§4.6): do these known msg ids still exist? batched 100 max. */
   async messagesExist(chatId: number, msgIds: number[]): Promise<boolean[]> {
     const client = this.requireConnect();
