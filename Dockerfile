@@ -27,7 +27,10 @@ ENV NODE_ENV=production \
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY --from=build /app/dist ./dist
-RUN npm prune --omit=dev && npm cache clean --force
+# prune-only: scripts must NOT re-run here — `npm ci` already built
+# better-sqlite3 (prebuild-install needs network; node-gyp needs Python 3,
+# neither guaranteed in the slim runtime image). M7.14.1 deploy fix.
+RUN npm prune --omit=dev --ignore-scripts && npm cache clean --force
 # /data is the WAL index home (§4.11); pre-own it so named/bind volumes and the
 # non-root USER both work (compose mounts initialize from the image layer).
 RUN mkdir -p /data && chown -R node:node /data

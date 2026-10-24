@@ -333,6 +333,14 @@ iberately not built: full status page = the `/status`
   restarts: set `RECONCILE_INTERVAL_HOURS=1` (env min bound).
   Suite 160/160, version 0.7.14-delindex.
 
+- **M7.14.1 ✅ deploy fix: runtime prune never re-runs install scripts** — the
+  v0.7.14-delindex deploy failed in the Docker runtime stage: `npm prune
+  --omit=dev` re-ran better-sqlite3's install script, prebuild-install
+  aborted (transient network) and node-gyp needs Python, absent in the
+  `node:*-slim` runtime image. Fix: `npm prune --omit=dev --ignore-scripts`
+  — the binary from `npm ci` in the deps stage is already in node_modules
+  and survives pruning. Version 0.7.14-dockerfix.
+
 ## Open drills (manual acceptance on Render)
 
 - [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)
