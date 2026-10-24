@@ -435,6 +435,15 @@ class BotApi implements BotTransport {
   }
 }
 
+/** B3: process-wide bot health counters — surfaced in /payload status only. */
+export const botHealth = {
+  running: false,
+  sweeps: 0,
+  pushed: 0,
+  lastSweepAt: 0,
+  errors: 0,
+};
+
 /** Long-poll router loop: pushes updates into the router with error backoff. */
 export function startCurationBot(
   deps: Omit<CurationDeps, "transport">,
@@ -446,11 +455,17 @@ export function startCurationBot(
   let offset = 0;
   let backoffMs = 1000;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let lastSweep = Date.now();
+  botHealth.running = true;
 
   void (async () => {
     try {
-      await bot.sweep();
+      botHealth.pushed += await bot.sweep();
+      botHealth.sweeps += 1;
+      botHealth.lastSweepAt = Date.now();
+      lastSweep = botHealth.lastSweepAt;
     } catch (e) {
+      botHealth.errors += 1;
       deps.log(`bot: startup sweep failed (${(e as Error).message})`);
     }
   })();
@@ -465,8 +480,21 @@ export function startCurationBot(
           await bot.handleUpdate(u);
         }
       } catch (e) {
+        botHealth.errors += 1;
         backoffMs = Math.min(backoffMs * 2, 30_000);
         deps.log(`bot: poll backoff ${backoffMs} ms (${(e as Error).message})`);
+      }
+      // B3: periodic sweep is independent of update traffic (SDD §5 automatic)
+      if (Date.now() - lastSweep >= deps.cfg.bot.sweepSeconds * 1000) {
+        lastSweep = Date.now();
+        try {
+          botHealth.pushed += await bot.sweep();
+          botHealth.sweeps += 1;
+          botHealth.lastSweepAt = Date.now();
+        } catch (e) {
+          botHealth.errors += 1;
+          deps.log(`bot: sweep failed (${(e as Error).message})`);
+        }
       }
       if (stopped) return;
       await new Promise<void>((resolve) => {
@@ -481,6 +509,7 @@ export function startCurationBot(
     handleUpdate: bot.handleUpdate,
     stop: () => {
       stopped = true;
+      botHealth.running = false;
       if (timer) clearTimeout(timer);
     },
   };

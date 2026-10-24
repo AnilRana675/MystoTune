@@ -281,6 +281,18 @@ iberately not built: full status page = the `/status`
   backoff. Network-free tests: scan purity + scripted taps (stranger
   refusal, keep-safety, delete plan, receipt, edit-failure tolerance).
 
+- **M7.11 ✅ curation bot slices (B1–B3)** — B1 duplicates: `dupeGroups`
+  clusters by normalized `(artist, title)` unioned with exact `(mime, size)`
+  twins (a copy that matches both rules stays ONE card; card ids are
+  4-segment `dupe:{chat}:{best}:{min}` so one row in two clusters never
+  collides); keeper suggestion is lossless-first then biggest then newest,
+  and `Delete others` removes only non-keepers via the owner-session seam.
+  B2 durable memory: `bot_reviews` sqlite table (PK id) — keeps and
+  successful deletes never re-ask across restarts, failed deletes stay
+  re-askable. B3 hardening: `BOT_SWEEP_SECONDS`-driven periodic sweeps
+  independent of update traffic, `bot:{running,sweeps,pushed,lastSweepAt,
+  errors,cronSec}` surfaced in `/{secret}/status`, version 0.7.11-curation.
+
 ## Open drills (manual acceptance on Render)
 
 - [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)

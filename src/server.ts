@@ -40,7 +40,7 @@ import { Lru, TelegramManager, TelegramSourceError, type ArtSource } from "./tel
 import { audioDescriptor, audioQuality, cleanName, formatOf, parseTrackId, qualityLabel } from "./indexer";
 import { probeFirstBytes } from "./probe";
 import { IndexIndexer, restoreSnapshotIfEmpty, waitRedisUp } from "./index-loop";
-import { startCurationBot } from "./bot";
+import { botHealth, startCurationBot } from "./bot";
 import { openRedisStore, type RedisStore } from "./redis";
 import { renderSetupPage, SetupAccess, SetupError, SetupManager, type LoginFactory, type SetupChannel, type SetupDeps, type SetupLogin } from "./setup";
 import bigInt from "big-integer"; // gramJS BigInteger for the setup login adapter
@@ -748,6 +748,8 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
         docEntries: runtime.telegram.resolvedDocs.size,
         queryEntries: redisStore ? redisStore.queryEntryCount() : 0,
       },
+      // M7.11-B3: bot health surfaces only when the curation bot is on
+      bot: cfg.bot.enabled ? { ...botHealth, cronSec: cfg.bot.sweepSeconds } : undefined,
       counters: {
         searches: metrics.searches,
         streams: metrics.streamResolves,

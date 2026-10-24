@@ -1,6 +1,6 @@
 {
   "name": "bitchord-telegram-addon",
-  "version": "0.7.0-discovery",
+  "version": "0.7.11-curation",
   "private": true,
   "description": "BitChord addon server that streams audio from your own Telegram chats",
   "license": "MIT",
