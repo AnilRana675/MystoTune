@@ -322,6 +322,17 @@ iberately not built: full status page = the `/status`
   review ids unchanged so past decisions survive. Suite 159/159, version
   0.7.13-dupes.
 
+- **M7.14 ✅ deletion-aware index** — "why doesn't indexCount drop when I
+  delete": cursor syncs only fetch NEW messages, so a deleted track is
+  re-seen by nobody until the reconcile pass (first fire = 24 h after
+  boot). Now (a) every bot deletion — junk tap, per-copy 🗑, ★ bulk —
+  purges the stale rows from SQLite + tracks_fts immediately
+  (`deleteTracksByMsg`; receipts say "index updated"); (b) a boot
+  reconcile reaps app-side deletions 90 s after every restart
+  (`reconcileBootDelayMs` ctor seam); (c) app-side deletes between
+  restarts: set `RECONCILE_INTERVAL_HOURS=1` (env min bound).
+  Suite 160/160.
+
 ## Open drills (manual acceptance on Render)
 
 - [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)

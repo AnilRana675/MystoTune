@@ -11,7 +11,11 @@
  */
 import type { AppConfig } from "./config";
 import type { Database } from "better-sqlite3";
-import { decidedReview, recordReview } from "./db";
+import {
+  decidedReview,
+  deleteTracksByMsg,
+  recordReview,
+} from "./db";
 
 /* ------------------------------------------------------------------ types */
 
@@ -560,6 +564,7 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
           // remembered until the index catches up: deleted copies leave the
           // group on the NEXT tap too, so a set always settles at ≤1 copy
           removed.add(`dupe:${chatId}:${target}`);
+          deleteTracksByMsg(db, chatId, [target]); // M7.14: purge the stale index row now
           const rest = group
             ? group.members.filter((r) => !removed.has(`dupe:${chatId}:${r.msgId}`))
             : [];
@@ -583,7 +588,7 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
                 ? `✅ Settled — msg ${rest[0]?.msgId} stays; this set won't ask again.`
                 : `✅ Done — ${
                     group ? "last copy of the set" : `msg ${target}`
-                  } removed. The next sync refreshes the index.`;
+                  } removed. The index is already updated.`;
             cardKeyboard = null; // clears the stale inline keyboard
           }
         }
@@ -596,7 +601,8 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
           if (res.error === undefined) {
             recordReview(db, cardId, "delete");
             removed.add(`dupe:${chatId}:${msgId}`); // junk dupes stop counting in dupe sets too
-            receipt = `✅ Deleted (msg ${msgId}). The next sync refreshes the index.`;
+            deleteTracksByMsg(db, chatId, [msgId]); // M7.14: purge the stale index row now
+            receipt = `✅ Deleted (msg ${msgId}). The index is updated immediately — no wait for the next sync.`;
           } else {
             receipt = `⚠️ Could not delete (msg ${msgId}): ${res.error} — it stays queued; the next sweep re-asks.`;
           }
@@ -623,7 +629,8 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
           if (res.error === undefined) {
             recordReview(db, cardId, "delete");
             for (const id of others) removed.add(`dupe:${chatId}:${id}`);
-            receipt = `✅ Deleted ${res.deleted} other cop${res.deleted === 1 ? "y" : "ies"} — kept msg ${group.best.msgId} (★). The next sync refreshes the index.`;
+            deleteTracksByMsg(db, chatId, others); // M7.14: purge stale rows now
+            receipt = `✅ Deleted ${res.deleted} other cop${res.deleted === 1 ? "y" : "ies"} — kept msg ${group.best.msgId} (★). The index is updated immediately.`;
           } else {
             receipt = `⚠️ Could not delete: ${res.error} — tap Delete all but ★ again to retry.`;
           }
