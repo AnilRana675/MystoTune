@@ -304,6 +304,24 @@ iberately not built: full status page = the `/status`
   network-free; `notifyNewRows` + bot-health updates covered by a new
   round-trip test. Suite 158/158, version 0.7.12-events.
 
+- **M7.13 ✅ dupe detection v2: version-aware two-tier cards + per-copy
+  delete** — the false-flag of the day: `normalizeTitle` stripped
+  `(Remix)`/`(feat. X)`/`(Radio Edit)` so remixes clustered with originals
+  and got "delete others" cards. Now `splitTitle` separates the song
+  identity (base) from its version annotation (extras), and `sameTake`
+  classifies each cluster: byte-identical uploads are always `copies` (any
+  titles); base + version + duration within ±3 s → `copies`; same song,
+  different version/duration → `variant` — the card says these are
+  separate recordings, has NO mass-delete button, and lists every copy
+  with its own real title, size, duration, format and `#N` number.
+  Per-copy `🗑 Delete #N` buttons (64-byte callback data), `🫶 Keep all`,
+  ★ bulk delete on copies only; the card edits itself after each tap
+  (`editMessage` now carries `reply_markup`, clears when a set settles)
+  and a `removed` memory makes sets settle at ≤1 copy even while the
+  SQLite index still lists deleted rows. Old 4-segment taps keep working;
+  review ids unchanged so past decisions survive. Suite 159/159, version
+  0.7.13-dupes.
+
 ## Open drills (manual acceptance on Render)
 
 - [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)
