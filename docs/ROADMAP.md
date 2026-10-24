@@ -293,6 +293,17 @@ iberately not built: full status page = the `/status`
   independent of update traffic, `bot:{running,sweeps,pushed,lastSweepAt,
   errors,cronSec}` surfaced in `/{secret}/status`, version 0.7.11-curation.
 
+- **M7.12 ✅ event-driven curation sweeps (SDD §5, B5)** — the indexer's
+  sync pass now reports newly added rows through an `onNewRows` hook
+  (coalesced once per pass), and `startCurationBot` turns each notification
+  into a trailing sweep (15 s delay, one sweep per burst, timer cleared on
+  stop) so fresh uploads reach the owner's review cards in minutes instead
+  of waiting for the next `BOT_SWEEP_SECONDS` tick. Standby replicas skip
+  the event (no double-curating without the lease); the transport is now
+  injectable at `startCurationBot` (gate-2 M7 seam) and tests stay
+  network-free; `notifyNewRows` + bot-health updates covered by a new
+  round-trip test. Suite 158/158, version 0.7.12-events.
+
 ## Open drills (manual acceptance on Render)
 
 - [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)

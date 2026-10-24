@@ -1229,7 +1229,12 @@ export async function main(): Promise<void> {
   }
 
   const telegram = new TelegramManager(cfg, redis);
-  const indexer = new IndexIndexer(db, telegram, cfg, undefined, redis);
+  // M7.11-B5: the curation bot is created below (after runtime wiring); the
+  // hook starts as a no-op and rebinds once the bot exists.
+  const botOnRows: { notify: (added: number) => void } = { notify: () => undefined };
+  const indexer = new IndexIndexer(db, telegram, cfg, undefined, redis, (added) =>
+    botOnRows.notify(added),
+  );
 
   // M6.1 (doc 7.2): BOOT picks SETUP (no session configured) or STANDBY
   // (waiting for the lease). The server reads the same mutable cell, so all
@@ -1252,7 +1257,9 @@ export async function main(): Promise<void> {
     const t2 = new TelegramManager(cfg2, redis);
     runtime.telegram = t2;
     runtime.cfg = cfg2;
-    runtime.indexer = new IndexIndexer(db, t2, cfg2, undefined, redis);
+    runtime.indexer = new IndexIndexer(db, t2, cfg2, undefined, redis, (added) =>
+      botOnRows.notify(added),
+    );
     modeBox.mode = "standby"; // doc 7.9.2
     try {
       await restoreSnapshotIfEmpty(db, cfg2, redis); // doc 7.9.3 snapshot first
@@ -1352,6 +1359,9 @@ export async function main(): Promise<void> {
     // replicas running main() must not long-poll the same BOT_TOKEN.
     active: () => modeBox.mode === "active",
   });
+  // M7.11-B5: indexer row events now feed the curation bot (coalesced sweeps
+  // close the BOT_SWEEP_SECONDS gap; no-op when the bot is disabled).
+  botOnRows.notify = (added) => curationBot?.notifyNewRows(added);
   /** STANDBY → ACTIVE: connect Telegram (overlap-retry), then start indexing.   * Reads runtime.* — the M6.2 finish flow replaces the manager before the
    * first goActive() under SETUP boot. */
   const goActive = async (): Promise<void> => {

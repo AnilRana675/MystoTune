@@ -85,7 +85,7 @@ everything and marks the group answered-keep-all. Unknown/lapsed callback taps
 ```
 BOT_TOKEN=               # BotFather token; empty = bot disabled (default)
 BOT_ALLOWED_IDS=         # owner's numeric Telegram user id (first = cards chat)
-BOT_SWEEP_SECONDS=86400  # automatic sweep interval (B3)
+88:BOT_SWEEP_SECONDS=86400  # automatic sweep interval (B3; B5 events sweep sooner)
 BOT_DECISION_TTL_SECONDS=604800  # taps older than this expire the card (default 7 d)
 ```
 
