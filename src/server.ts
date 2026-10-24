@@ -1343,8 +1343,14 @@ export async function main(): Promise<void> {
   const curationBot = startCurationBot({
     cfg,
     db,
-    deleter: (chatId, msgIds) => telegram.deleteChannelMessages(chatId, msgIds),
+    deleter: (chatId, msgIds) =>
+      cfg.telegram.channels.includes(chatId)
+        ? telegram.deleteChannelMessages(chatId, msgIds)
+        : Promise.resolve({ deleted: 0, error: "chat not indexed" }),
     log: (line) => app.log.info(line),
+    // gate-2 H2: only the lease-holding (ACTIVE) instance curates — standby
+    // replicas running main() must not long-poll the same BOT_TOKEN.
+    active: () => modeBox.mode === "active",
   });
   /** STANDBY → ACTIVE: connect Telegram (overlap-retry), then start indexing.   * Reads runtime.* — the M6.2 finish flow replaces the manager before the
    * first goActive() under SETUP boot. */

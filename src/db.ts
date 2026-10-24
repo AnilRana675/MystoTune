@@ -216,19 +216,13 @@ export type ReviewOutcome = "keep" | "delete";
 /** The owner's durable answer for a review card id (`junk:*` / `dupe:*`):
  * decided cards never re-ask across restarts (SDD §5 B2). */
 export function decidedReview(db: Database.Database, id: string): ReviewOutcome | null {
-  const row = db.prepare("SELECT outcome FROM bot_reviews WHERE id = ?").get(id) as
-    | { outcome: string }
-    | undefined;
-  return row ? (row.outcome as ReviewOutcome) : null;
+  const row = stmts(db).reviewGet.get({ id }) as { outcome?: string } | undefined;
+  return row?.outcome ? (row.outcome as ReviewOutcome) : null;
 }
 
 /** Idempotent: the first decision wins (PK conflict ignores later writes). */
 export function recordReview(db: Database.Database, id: string, outcome: ReviewOutcome): void {
-  db.prepare("INSERT OR IGNORE INTO bot_reviews (id, decidedAt, outcome) VALUES (?, ?, ?)").run(
-    id,
-    Date.now(),
-    outcome,
-  );
+  stmts(db).reviewUp.run({ id, decidedAt: Date.now(), outcome });
 }
 
 /* ---------------------------------------------------------------- cursors (FR-14) */
@@ -711,6 +705,8 @@ interface Statements {
   oldestIds: Database.Statement<Record<string, unknown>>;
   getCursor: Database.Statement<Record<string, unknown>>;
   setCursor: Database.Statement<Record<string, unknown>>;
+  reviewGet: Database.Statement<{ id: string }>;
+  reviewUp: Database.Statement<{ id: string; decidedAt: number; outcome: string }>;
 }
 
 const stmtCache = new WeakMap<Database.Database, Statements>();
@@ -753,6 +749,10 @@ function stmts(db: Database.Database): Statements {
       setCursor: db.prepare(`
         INSERT INTO sync_cursors(chatId, minId) VALUES(@chatId, @minId)
         ON CONFLICT(chatId) DO UPDATE SET minId = @minId
+      `),
+      reviewGet: db.prepare("SELECT outcome FROM bot_reviews WHERE id = @id"),
+      reviewUp: db.prepare(`
+        INSERT OR IGNORE INTO bot_reviews (id, decidedAt, outcome) VALUES (@id, @decidedAt, @outcome)
       `),
     };
     stmtCache.set(db, s);

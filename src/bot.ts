@@ -91,6 +91,9 @@ function fmtBytes(n: number): string {
   return `${n} B`;
 }
 
+/** gate-2 L3: attacker-influenced strings never blow the 4096 send cap. */
+const clamp = (s: string, n = 200): string => (s.length > n ? `${s.slice(0, n)}…` : s);
+
 /** Plain-text card body (no Markdown — Telegram parse surprises stay out). */
 export function junkCardText(r: ScanRow, why: string): string {
   const bits: string[] = [];
@@ -99,8 +102,8 @@ export function junkCardText(r: ScanRow, why: string): string {
   if (r.mime !== null) bits.push(r.mime);
   return [
     "🗑 Junk candidate",
-    `Title: ${r.title}`,
-    `Artist: ${r.artist ?? "—"}`,
+    `Title: ${clamp(r.title)}`,
+    `Artist: ${r.artist === null ? "—" : clamp(r.artist)}`,
     `Where: chat ${r.chatId} · msg ${r.msgId}`,
     `Why: ${why || "flagged"}${bits.length > 0 ? ` (${bits.join(" · ")})` : ""}`,
     "",
@@ -157,8 +160,9 @@ export function pickBest(members: ScanRow[]): ScanRow {
 }
 
 /** SDD §3 duplicate rules: same (artist, normalized title) OR exact
- * (mime, size) twins. Rules merge into clusters (union-find over shared
- * rows) so a pair matching both rules yields ONE card, not two. */
+ * (mime, size) twins. A row's two keys live in ONE cluster — the O(1) key→
+ * cluster map unions the pair when they differ (gate-2: the old linear
+ * `hits` scan never fired, and a both-rules pair yielded two cards). */
 export function dupeGroups(rows: ScanRow[]): DupeGroup[] {
   const byChat = new Map<number, ScanRow[]>();
   for (const r of rows) {
@@ -169,33 +173,43 @@ export function dupeGroups(rows: ScanRow[]): DupeGroup[] {
   }
   const out: DupeGroup[] = [];
   for (const [chatId, list] of byChat) {
-    const clusters: Array<{ seen: Set<string>; rows: ScanRow[] }> = [];
-    // place a row into the cluster owning its key; merge clusters sharing it
-    const addTo = (key: string, r: ScanRow): void => {
-      const hits = clusters.filter((c) => c.seen.has(key));
-      if (hits.length === 0) {
-        clusters.push({ seen: new Set([key]), rows: [r] });
-        return;
-      }
-      const first = hits[0] as { seen: Set<string>; rows: ScanRow[] };
-      if (!first.rows.includes(r)) first.rows.push(r);
-      for (const extra of hits.slice(1)) {
-        for (const rr of extra.rows) if (!first.rows.includes(rr)) first.rows.push(rr);
-        for (const k of extra.seen) first.seen.add(k);
-        clusters.splice(clusters.indexOf(extra), 1);
-      }
-    };
+    interface Cluster {
+      seen: Set<string>;
+      rows: ScanRow[];
+    }
+    const clusters: Cluster[] = [];
+    const owner = new Map<string, Cluster>();
     for (const r of list) {
-      addTo(`t:${r.artist ?? ""}|${normalizeTitle(r.title)}`, r);
-      addTo(`s:${r.mime ?? ""}|${r.size}`, r);
+      const tk = `t:${r.artist ?? ""}|${normalizeTitle(r.title)}`;
+      const sk = `s:${r.mime ?? ""}|${r.size}`;
+      const tC = owner.get(tk);
+      const sC = owner.get(sk);
+      if (tC && sC && tC !== sC) {
+        // both-rule row bridges two clusters → union sC into tC
+        for (const rr of sC.rows) if (!tC.rows.includes(rr)) tC.rows.push(rr);
+        for (const k of sC.seen) owner.set(k, tC);
+        clusters.splice(clusters.indexOf(sC), 1);
+      }
+      const home = tC ?? sC;
+      if (home) {
+        home.seen.add(tk);
+        home.seen.add(sk);
+        owner.set(tk, home);
+        owner.set(sk, home);
+        if (!home.rows.includes(r)) home.rows.push(r);
+      } else {
+        const fresh: Cluster = { seen: new Set([tk, sk]), rows: [r] };
+        clusters.push(fresh);
+        owner.set(tk, fresh);
+        owner.set(sk, fresh);
+      }
     }
     for (const c of clusters) {
       if (c.rows.length < 2) continue;
       c.rows.sort((a, b) => a.msgId - b.msgId);
       const best = pickBest(c.rows);
-      const min = c.rows[0]?.msgId;
       out.push({
-        id: `dupe:${chatId}:${best.msgId}:${min}`,
+        id: `dupe:${chatId}:${best.msgId}:${c.rows[0]?.msgId}`,
         chatId,
         members: c.rows,
         best,
@@ -209,8 +223,8 @@ export function dupeGroups(rows: ScanRow[]): DupeGroup[] {
 export function dupeCardText(g: DupeGroup): string {
   return [
     `👯 Duplicate set (${g.members.length} copies)`,
-    `Title: ${g.best.title}`,
-    `Artist: ${g.best.artist ?? "—"}`,
+    `Title: ${clamp(g.best.title)}`,
+    `Artist: ${g.best.artist === null ? "—" : clamp(g.best.artist)}`,
     "",
     ...g.members.map((r) =>
       `${r.msgId === g.best.msgId ? "★" : "·"} msg ${r.msgId} · ${fmtBytes(r.size ?? 0)} · ${r.mime ?? "?"}${r.lossless === 1 ? " · lossless" : ""}`,
@@ -236,14 +250,26 @@ export interface CurationDeps {
   deleter: Sadle;
   transport: BotTransport;
   log: (line: string) => void;
+  /** gate-2: lease/mode gate — standby replicas and drain states must not
+   * poll Telegram or push cards (deps.active defaults to always-on). */
+  active?: () => boolean;
 }
 
 export function createCurationBot(deps: CurationDeps): CurationBot {
-  const { cfg, db, deleter, transport, log } = deps;
+  const { cfg, db, deleter, transport, log: rawLog } = deps;
+  const isActive = deps.active ?? (() => true);
+  /** Bot tokens sit in fetch URLs — a malformed-token URL-parse error would
+   * carry the whole URL. Every log line gets token-redacted (review M1). */
+  const log = (line: string): void =>
+    rawLog(cfg.bot.token && line.includes(cfg.bot.token)
+      ? line.split(cfg.bot.token).join("<bot-token>")
+      : line);
   const allowed = new Set(cfg.bot.allowedIds);
   const ownerChat = cfg.bot.allowedIds[0] as number;
-  /** Cards pushed this process — pending answers re-ask after a restart (§5). */
+  /** Cards pushed this process — pending decisions re-ask after a restart (§5). */
   const asked = new Set<string>();
+  /** gate-2 L2: ids that failed delivery /too many times retire for the run. */
+  const attempts = new Map<string, number>();
 
   const scanRows = (): ScanRow[] =>
     (
@@ -254,54 +280,75 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
         .all() as Array<Record<string, unknown>>
     ).map(junkRowFromDb);
 
+  /** One card send with retry bookkeeping: mark-asked first (so a cap slice
+   * seen mid-sweep counts), dead-letter after 3 failed sends. */
+  async function sendOnce(
+    id: string,
+    text: string,
+    keyboard: CardKeyboard,
+    onOk: () => void,
+  ): Promise<void> {
+    asked.add(id);
+    try {
+      const messageId = await transport.sendCard(
+        ownerChat,
+        text.length > 4000 ? text.slice(0, 4000) : text,
+        keyboard,
+      );
+      if (messageId === null) throw new Error("unknown delivery");
+      attempts.delete(id);
+      onOk();
+    } catch (e) {
+      const n = (attempts.get(id) ?? 0) + 1;
+      attempts.set(id, n);
+      if (n >= 3) {
+        log(`bot: card ${id} retired after 3 failed sends (${(e as Error).message})`);
+      } else {
+        asked.delete(id); // retry on the next sweep
+        log(`bot: failed to push card ${id} (${(e as Error).message})`);
+      }
+    }
+  }
+
   async function sweep(): Promise<number> {
-    if (!cfg.bot.enabled) return 0;
+    if (!cfg.bot.enabled || !isActive()) return 0;
     const rows = scanRows();
-    const findings = junkFindings(rows).filter(
-      (f) => !asked.has(f.id) && decidedReview(db, f.id) === null,
-    );
     const groups = dupeGroups(rows).filter(
       (g) => !asked.has(g.id) && decidedReview(db, g.id) === null,
     );
+    // junk-first, but reserve up to two budget slots so dupes never starve
+    const junkCap = Math.max(1, MAX_CARDS_PER_SWEEP - Math.min(2, groups.length));
+    const findings = junkFindings(rows).filter(
+      (f) => !asked.has(f.id) && decidedReview(db, f.id) === null,
+    );
     let junk = 0;
     let dupes = 0;
-    for (const f of findings.slice(0, MAX_CARDS_PER_SWEEP)) {
-      if (asked.has(f.id)) continue; // a cap slice seen while sending still counts as asked
-      asked.add(f.id);
-      try {
-        const messageId = await transport.sendCard(ownerChat, junkCardText(f.row, f.why), {
-          buttons: [[
-            { text: `Delete msg ${f.row.msgId}`, data: `junk:${f.row.chatId}:${f.row.msgId}:del` },
-            { text: "Keep", data: `junk:${f.row.chatId}:${f.row.msgId}:keep` },
-          ]],
-        });
-        if (messageId === null) asked.delete(f.id); // unknown delivery — retry next sweep
-        else junk += 1;
-      } catch (e) {
-        asked.delete(f.id); // failed sends retry on the next sweep
-        log(`bot: failed to push junk card (${(e as Error).message})`);
-      }
+    for (const f of findings.slice(0, junkCap)) {
+      if (asked.has(f.id)) continue;
+      await sendOnce(f.id, junkCardText(f.row, f.why), {
+        buttons: [[
+          { text: `Delete msg ${f.row.msgId}`, data: `junk:${f.row.chatId}:${f.row.msgId}:del` },
+          { text: "Keep", data: `junk:${f.row.chatId}:${f.row.msgId}:keep` },
+        ]],
+      }, () => {
+        junk += 1;
+      });
     }
     // B1: duplicate sets after junk, sharing the sweep budget
     for (const g of groups) {
       if (junk + dupes >= MAX_CARDS_PER_SWEEP) break;
-      asked.add(g.id);
-      try {
-        const messageId = await transport.sendCard(ownerChat, dupeCardText(g), {
-          buttons: [[
-            {
-              text: `Delete others (keep msg ${g.best.msgId})`,
-              data: `dupe:${g.chatId}:${g.best.msgId}:${g.members[0]?.msgId}:del`,
-            },
-            { text: "Keep all", data: `dupe:${g.chatId}:${g.best.msgId}:${g.members[0]?.msgId}:keep` },
-          ]],
-        });
-        if (messageId === null) asked.delete(g.id);
-        else dupes += 1;
-      } catch (e) {
-        asked.delete(g.id);
-        log(`bot: failed to push dupe card (${(e as Error).message})`);
-      }
+      if (asked.has(g.id)) continue; // gate-2 C1 belt: both-rules pairs dedupe by id
+      await sendOnce(g.id, dupeCardText(g), {
+        buttons: [[
+          {
+            text: `Delete others (keep msg ${g.best.msgId})`,
+            data: `dupe:${g.chatId}:${g.best.msgId}:${g.members[0]?.msgId}:del`,
+          },
+          { text: "Keep all", data: `dupe:${g.chatId}:${g.best.msgId}:${g.members[0]?.msgId}:keep` },
+        ]],
+      }, () => {
+        dupes += 1;
+      });
     }
     if (junk + dupes > 0) {
       log(`bot: sweep pushed ${junk} junk card(s) and ${dupes} dupe card(s)`);
@@ -330,52 +377,56 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
     const cardId = data.slice(0, data.lastIndexOf(":")); // stable review id (no action suffix)
     let receipt: string;
     let answer = choice === "keep" ? "Kept" : "Deleting…";
-    if (!dupeM) {
-      if (choice === "keep") {
-        recordReview(db, cardId, "keep");
-        receipt = `🫶 Kept “${msgId}” — this card will not come back.`;
-      } else {
-        const res = await deleter(chatId, [msgId]);
-        if (res.error === undefined) {
-          recordReview(db, cardId, "delete");
-          receipt = `✅ Deleted (msg ${msgId}). The next sync refreshes the index.`;
+    try {
+      if (!dupeM) {
+        if (choice === "keep") {
+          recordReview(db, cardId, "keep");
+          receipt = `🫶 Kept “${msgId}” — this card will not come back.`;
         } else {
-          receipt = `⚠️ Could not delete (msg ${msgId}): ${res.error} — it stays queued; the next sweep re-asks.`;
+          const res = await deleter(chatId, [msgId]);
+          if (res.error === undefined) {
+            recordReview(db, cardId, "delete");
+            receipt = `✅ Deleted (msg ${msgId}). The next sync refreshes the index.`;
+          } else {
+            receipt = `⚠️ Could not delete (msg ${msgId}): ${res.error} — it stays queued; the next sweep re-asks.`;
+          }
+        }
+      } else {
+        // B1: recompute groups at tap time — the index may have moved; stateless.
+        const dupeMin = Number(dupeM?.[3]);
+        const group = dupeGroups(scanRows()).find(
+          (g) => g.id === `dupe:${chatId}:${msgId}:${dupeMin}`,
+        );
+        if (!group) {
+          receipt = `🫥 No duplicate set left (msg ${msgId}) — maybe already handled.`;
+          answer = "Nothing left";
+        } else if (choice === "keep") {
+          recordReview(db, cardId, "keep");
+          receipt = `🫶 Kept the whole set — msg ${group.best.msgId} stays.`;
+        } else {
+          const others = group.members.map((r) => r.msgId).filter((id) => id !== group.best.msgId);
+          const res = await deleter(chatId, others);
+          if (res.error === undefined) {
+            recordReview(db, cardId, "delete");
+            receipt = `✅ Deleted ${res.deleted} other cop${res.deleted === 1 ? "y" : "ies"} — kept msg ${group.best.msgId} (★). The next sync refreshes the index.`;
+          } else {
+            receipt = `⚠️ Could not delete: ${res.error} — tap Delete others again to retry.`;
+          }
         }
       }
-    } else {
-      // B1: recompute groups at tap time — the index may have moved; stateless.
-      const dupeMin = Number(dupeM?.[3]);
-      const group = dupeGroups(scanRows()).find(
-        (g) => g.id === `dupe:${chatId}:${msgId}:${dupeMin}`,
-      );
-      if (!group) {
-        receipt = `🫥 No duplicate set left (msg ${msgId}) — maybe already handled.`;
-        answer = "Nothing left";
-      } else if (choice === "keep") {
-        recordReview(db, cardId, "keep");
-        receipt = `🫶 Kept the whole set — msg ${group.best.msgId} stays.`;
-      } else {
-        const others = group.members.map((r) => r.msgId).filter((id) => id !== group.best.msgId);
-        const res = await deleter(chatId, others);
-        if (res.error === undefined) {
-          recordReview(db, cardId, "delete");
-          receipt = `✅ Deleted ${res.deleted} other cop${res.deleted === 1 ? "y" : "ies"} — kept msg ${group.best.msgId} (★). The next sync refreshes the index.`;
-        } else {
-          receipt = `⚠️ Could not delete: ${res.error} — tap Delete others again to retry.`;
+      const chatT = cb.message?.chat?.id;
+      const msgT = cb.message?.message_id;
+      if (chatT !== undefined && msgT !== undefined) {
+        try {
+          await transport.editMessage(chatT, msgT, receipt);
+        } catch (e) {
+          log(`bot: receipt edit failed (${(e as Error).message})`);
         }
       }
+    } finally {
+      // gate-2 L5/M6: the spinner ALWAYS stops, even if the receipt path throws
+      await transport.answerCallback(cb.id, answer);
     }
-    const chatT = cb.message?.chat?.id;
-    const msgT = cb.message?.message_id;
-    if (chatT !== undefined && msgT !== undefined) {
-      try {
-        await transport.editMessage(chatT, msgT, receipt);
-      } catch (e) {
-        log(`bot: receipt edit failed (${(e as Error).message})`);
-      }
-    }
-    await transport.answerCallback(cb.id, answer);
   }
 
   return { sweep, handleUpdate, stop: () => undefined };
@@ -451,38 +502,68 @@ export function startCurationBot(
   if (!deps.cfg.bot.enabled) return null;
   const api = new BotApi(deps.cfg.bot.token);
   const bot = createCurationBot({ ...deps, transport: api });
+  // loop-level logs carry raw fetch error messages — redact the token here too
+  const redLog = (line: string): void =>
+    deps.log(deps.cfg.bot.token && line.includes(deps.cfg.bot.token)
+      ? line.split(deps.cfg.bot.token).join("<bot-token>")
+      : line);
+  const isActive = deps.active ?? (() => true);
   let stopped = false;
   let offset = 0;
   let backoffMs = 1000;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let resolveSleep: (() => void) | null = null;
   let lastSweep = Date.now();
-  botHealth.running = true;
+  botHealth.running = isActive();
 
   void (async () => {
     try {
+      if (!isActive()) {
+        lastSweep = Date.now(); // standby first boots sweep when promoted
+        return;
+      }
       botHealth.pushed += await bot.sweep();
       botHealth.sweeps += 1;
       botHealth.lastSweepAt = Date.now();
       lastSweep = botHealth.lastSweepAt;
     } catch (e) {
       botHealth.errors += 1;
-      deps.log(`bot: startup sweep failed (${(e as Error).message})`);
-    }
+      redLog(`bot: startup sweep failed (${(e as Error).message})`);    }
   })();
+
+  const sleep = (ms: number): Promise<void> =>
+    new Promise<void>((resolve) => {
+      resolveSleep = resolve;
+      timer = setTimeout(resolve, ms); // keep the handle live for stop()
+    });
 
   const loop = async (): Promise<void> => {
     while (!stopped) {
+      if (!isActive()) {
+        // gate-2 H2: a replica without the lease polls Telegram for nothing
+        // (409 storms against the active instance); idle cheaply instead.
+        botHealth.running = false;
+        await sleep(Math.min(backoffMs, 5_000));
+        continue;
+      }
+      botHealth.running = true;
       try {
         const updates = await api.getUpdates(offset);
         backoffMs = 1000;
         for (const u of updates) {
           if (typeof u.update_id === "number" && u.update_id >= offset) offset = u.update_id + 1;
-          await bot.handleUpdate(u);
+          if (stopped) return; // gate-2 M5: no work rides during the drain exit
+          try {
+            await bot.handleUpdate(u); // gate-2 M6: one bad update can't sink its batch
+          } catch (e) {
+            botHealth.errors += 1;
+            redLog(`bot: update failed (${(e as Error).message})`);
+          }
         }
       } catch (e) {
         botHealth.errors += 1;
         backoffMs = Math.min(backoffMs * 2, 30_000);
-        deps.log(`bot: poll backoff ${backoffMs} ms (${(e as Error).message})`);
+        redLog(`bot: poll backoff ${backoffMs} ms (${(e as Error).message})`);
       }
       // B3: periodic sweep is independent of update traffic (SDD §5 automatic)
       if (Date.now() - lastSweep >= deps.cfg.bot.sweepSeconds * 1000) {
@@ -493,13 +574,11 @@ export function startCurationBot(
           botHealth.lastSweepAt = Date.now();
         } catch (e) {
           botHealth.errors += 1;
-          deps.log(`bot: sweep failed (${(e as Error).message})`);
+          redLog(`bot: sweep failed (${(e as Error).message})`);
         }
       }
       if (stopped) return;
-      await new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, backoffMs); // keep the handle live for stop()
-      });
+      await sleep(backoffMs);
     }
   };
   void loop();
@@ -511,6 +590,7 @@ export function startCurationBot(
       stopped = true;
       botHealth.running = false;
       if (timer) clearTimeout(timer);
+      if (resolveSleep) resolveSleep(); // gate-2 M5: wake the parked await so the loop can exit
     },
   };
 }

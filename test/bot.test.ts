@@ -73,8 +73,10 @@ class FakeTransport implements BotTransport {
   edits: Array<{ chatId: number; messageId: number; text: string }> = [];
   answered: Array<{ id: string; text: string }> = [];
   failEdits = false;
+  failSends = false;
 
   async sendCard(chatId: number, text: string, keyboard: CardKeyboard): Promise<number | null> {
+    if (this.failSends) throw new Error("send backend down");
     const id = this.sentIds.shift() ?? this.cards.length + 100;
     this.cards.push({ chatId, text, keyboard });
     return id;
@@ -131,7 +133,7 @@ test("junkFindings flags the SDD v1 signals and nothing else", () => {
 test("B0 end-to-end: sweep pushes owner-gated cards; delete tap drives the session seam", async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "m-bot2-"));
   try {
-    const cfg = baseEnv({ BOT_TOKEN: "123:A", BOT_ALLOWED_IDS: `${OWNER}` });
+    const cfg = baseEnv({ BOT_TOKEN: "123:AAAAAAAAAAAAAAAAAAAA", BOT_ALLOWED_IDS: `${OWNER}` });
     assert.equal(cfg.bot.enabled, true, "token + owner id => enabled");
     const db = openDb(path.join(dir, "i.sqlite"));
     createSchema(db);
@@ -221,37 +223,36 @@ test("B1 pure: normalize, cluster rules, and the deterministic keeper", () => {
   assert.equal(normalizeTitle("Stayin' Alive — Feat. Somebody"), "stayin alive");
 
   const groups = dupeGroups([
-    srow({ msgId: 2, size: 100 }), // "Away" — title cluster {2,3}
+    srow({ msgId: 2, size: 100 }), // "Away" — title cluster {2,3}; size twins with 7
     srow({ msgId: 3, size: 200, title: "away (feat. x)" }),
     srow({ msgId: 4, artist: "DJ K" }), // different artist → own cluster, alone
     srow({ msgId: 5, size: 500, title: "Alpha" }), // size+mime twin pair {5,6}
     srow({ msgId: 6, size: 500, title: "Beta" }),
-    srow({ msgId: 7, size: 100, title: "Gamma", lossless: 1 }), // t-cluster {7,8}
-    srow({ msgId: 8, size: 900, title: "Gamma" }),
+    srow({ msgId: 7, size: 100, title: "Gamma", lossless: 1 }), // bridges {2,3} via size twin
+    srow({ msgId: 8, size: 900, title: "Gamma" }), // bridges 7 via title → one transitive set
     srow({ msgId: 9, size: 0 }), // zero-size rows are the junk sweep's job, not dupes
     srow({ msgId: 10, chatId: -100777, size: 100 }), // per-chat isolation, alone
   ]);
+  // {2,3}∪{7,8} via the cross-rule size twin → ONE transitive duplicate set
+  assert.deepEqual(groups.map((g) => g.id), ["dupe:-100555:6:5", "dupe:-100555:7:2"]);
   assert.deepEqual(
-    groups.map((g) => g.id),
-    ["dupe:-100555:3:2", "dupe:-100555:6:5", "dupe:-100555:7:2", "dupe:-100555:7:7"],
+    groups[1]!.members.map((r) => r.msgId),
+    [2, 3, 7, 8],
+    "both rules union into one cluster (one card, not two)",
   );
-  assert.equal(groups[0]!.best.msgId, 3, "title cluster keeps the bigger file");
-  assert.deepEqual(groups[1]!.members.map((r) => r.msgId), [5, 6]);
-  assert.equal(groups[2]!.best.msgId, 7, "lossless wins over size");
-  assert.ok(groups[2]!.id.endsWith(":2"), "msg 2+7 are size/mime twins (cross-title rule)");
-  assert.equal(groups[3]!.best.msgId, 7, "title twins keep the lossless copy");
-  assert.ok(groups[2]!.id !== groups[3]!.id, "twin ids stay unique across rule clusters");
-  assert.equal(pickBest(groups[1]!.members).msgId, 6, "size tie → newest message wins");
-  const card = dupeCardText(groups[0]!);
-  assert.ok(card.includes("Duplicate set (2 copies)"));
-  assert.ok(card.includes("★ msg 3"));
+  assert.deepEqual(groups[0]!.members.map((r) => r.msgId), [5, 6]);
+  assert.equal(groups[1]!.best.msgId, 7, "lossless wins over size");
+  assert.equal(pickBest(groups[0]!.members).msgId, 6, "size tie → newest message wins");
+  const card = dupeCardText(groups[1]!);
+  assert.ok(card.includes("Duplicate set (4 copies)"));
+  assert.ok(card.includes("★ msg 7"));
   assert.ok(card.includes("· msg 2"));
 });
 
 test("B1 end-to-end: dupe card pushes once; delete tap removes only the others; gone ids answer gracefully", async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "m-bot3-"));
   try {
-    const cfg = baseEnv({ BOT_TOKEN: "123:A", BOT_ALLOWED_IDS: `${OWNER}` });
+    const cfg = baseEnv({ BOT_TOKEN: "123:AAAAAAAAAAAAAAAAAAAA", BOT_ALLOWED_IDS: `${OWNER}` });
     const db = openDb(path.join(dir, "i.sqlite"));
     createSchema(db);
     upsertTrack(db, row({ size: 5_000_000 })); // healthy — and a distinct size so the twin rule leaves it alone
@@ -295,12 +296,125 @@ test("B1 end-to-end: dupe card pushes once; delete tap removes only the others; 
   }
 });
 
+/* -------------------------------------- gate-2 remediation regressions */
+
+test("gate-2: both-rules pair yields exactly ONE card; budget caps junk-first; dead senders retire", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "m-bot5-"));
+  try {
+    const cfg = baseEnv({ BOT_TOKEN: "123:AAAAAAAAAAAAAAAAAAAA", BOT_ALLOWED_IDS: `${OWNER}` });
+    const db = openDb(path.join(dir, "i.sqlite"));
+    createSchema(db);
+    // C1: identical title AND identical size/mime → both rules, one card
+    upsertTrack(db, row({ id: "tg_n-100555_2", msgId: 2, title: "Echo", size: 3_000_000 }));
+    upsertTrack(db, row({ id: "tg_n-100555_3", msgId: 3, title: "Echo (feat. X)", size: 3_000_000 }));
+    const transport = new FakeTransport();
+    const bot = createCurationBot({ cfg, db, deleter: async () => ({ deleted: 0 }), transport, log: () => undefined });
+    assert.equal(await bot.sweep(), 1, "both rules → one card, not two");
+    assert.equal(transport.cards[0]!.text.startsWith("👯"), true);
+    await bot.sweep();
+    assert.equal(transport.cards.length, 1, "re-sweep stays quiet");
+
+    // budget: 12 junk + 2 dupe pairs → 10 cards total, junk capped, dupes never starve
+    const db2 = openDb(path.join(dir, "j.sqlite"));
+    createSchema(db2);
+    for (let i = 1; i <= 12; i++) {
+      upsertTrack(db2, row({
+        id: `tg_n-100555_${i}`,
+        msgId: i,
+        title: `Clip ${i}`,
+        duration: 5,
+        size: 100_000 * i + 50_000, // distinct sizes: no accidental dupe rules
+      }));
+    }
+    for (const [msg, size] of [[30, 2_000_000], [31, 2_100_000]] as Array<[number, number]>) {
+      upsertTrack(db2, row({
+        id: `tg_n-100555_${msg}`,
+        msgId: msg,
+        title: size === 2_000_000 ? "Same Name" : "Other Name",
+        artist: "The Band",
+        size,
+      }));
+      upsertTrack(db2, row({
+        id: `tg_n-100555_${msg + 10}`,
+        msgId: msg + 10,
+        title: size === 2_000_000 ? "Same Name (feat. x)" : "Other Name (feat. x)",
+        artist: "The Band",
+        size,
+      }));
+    }
+    const transport2 = new FakeTransport();
+    const bot2 = createCurationBot({
+      cfg,
+      db: db2,
+      deleter: async () => ({ deleted: 0 }),
+      transport: transport2,
+      log: () => undefined,
+    });
+    assert.equal(await bot2.sweep(), 10, "budget caps the sweep at 10");
+    assert.equal(transport2.cards.filter((c) => c.text.startsWith("🗑")).length, 8, "junk capped");
+    assert.equal(transport2.cards.filter((c) => c.text.startsWith("👯")).length, 2, "dupes never starve");
+
+    // dead-letter: an always-throwing transport retires the card after 3 sweeps
+    const db3 = openDb(path.join(dir, "k.sqlite"));
+    createSchema(db3);
+    upsertTrack(db3, row({ id: "tg_n-100555_7", msgId: 7, title: "Ringtone", duration: 8, size: 40_000 }));
+    const stale = new FakeTransport();
+    stale.failSends = true;
+    const bot3 = createCurationBot({
+      cfg,
+      db: db3,
+      deleter: async () => ({ deleted: 0 }),
+      transport: stale,
+      log: () => undefined,
+    });
+    await bot3.sweep(); // attempt 1
+    await bot3.sweep(); // attempt 2
+    assert.equal(stale.cards.length, 0, "failed sends never surface cards");
+    await bot3.sweep(); // attempt 3 → dead-letter retires the card
+    stale.failSends = false;
+    assert.equal(await bot3.sweep(), 0, "retired card does not re-push once delivery recovers");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("gate-2: malformed BOT_TOKEN fails config; junk allowed ids never enable", () => {
+  assert.throws(() => baseEnv({ BOT_TOKEN: "not-a-token" }), /malformed/);
+  const cfg = baseEnv({ BOT_TOKEN: "123:AAAAAAAAAAAAAAAAAAAA", BOT_ALLOWED_IDS: "1e3,-2" });
+  assert.equal(cfg.bot.enabled, false, "non-digit ids are filtered, not coerced");
+  assert.deepEqual(cfg.bot.allowedIds, []);
+});
+
+test("gate-2: standby replicas sweep nothing until promoted to active", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "m-bot6-"));
+  try {
+    const cfg = baseEnv({ BOT_TOKEN: "123:AAAAAAAAAAAAAAAAAAAA", BOT_ALLOWED_IDS: `${OWNER}` });
+    const db = openDb(path.join(dir, "i.sqlite"));
+    createSchema(db);
+    upsertTrack(db, row({ id: "tg_n-100555_2", msgId: 2, title: "Ringtone", duration: 8, size: 40_000 }));
+    let activeNow = false;
+    const bot = createCurationBot({
+      cfg,
+      db,
+      deleter: async () => ({ deleted: 0 }),
+      transport: new FakeTransport(),
+      log: () => undefined,
+      active: () => activeNow,
+    });
+    assert.equal(await bot.sweep(), 0, "standby sweeps nothing");
+    activeNow = true;
+    assert.equal(await bot.sweep(), 1, "promoted to active → sweeps");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 /* ------------------------------------------- B2 durable review memory */
 
 test("B2 durable: keep + successful delete decisions survive a fresh bot over the same database", async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "m-bot4-"));
   try {
-    const cfg = baseEnv({ BOT_TOKEN: "123:A", BOT_ALLOWED_IDS: `${OWNER}` });
+    const cfg = baseEnv({ BOT_TOKEN: "123:AAAAAAAAAAAAAAAAAAAA", BOT_ALLOWED_IDS: `${OWNER}` });
     const db = openDb(path.join(dir, "i.sqlite"));
     createSchema(db);
     upsertTrack(db, row({ size: 5_000_000 }));

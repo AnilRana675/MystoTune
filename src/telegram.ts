@@ -625,7 +625,11 @@ export class TelegramManager {
     }
     try {
       const res = await this.client.deleteMessages(chatId, msgIds, { revoke: true });
-      const n = Array.isArray(res) ? res.length : Number(res) || 0;
+      // gramJS returns one AffectedMessages per <=100-id chunk — sum pid counts,
+      // not array length (gate-2: receipts must report real message counts).
+      const n = Array.isArray(res)
+        ? (res as Array<{ ptsCount?: number }>).reduce((s, r) => s + (r?.ptsCount ?? 0), 0)
+        : 0;
       return { deleted: n };
     } catch (e) {
       const msg = (e as { errorMessage?: string; message?: string }).errorMessage

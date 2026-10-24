@@ -269,10 +269,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // M7.11 curation bot: token + owner id both required; additive + optional
     bot: (() => {
       const token = (env.BOT_TOKEN ?? "").trim();
+      if (token && !/^\d+:[A-Za-z0-9_-]{20,}$/.test(token)) {
+        throw new ConfigError(
+          "BOT_TOKEN looks malformed — copy it exactly from BotFather (no spaces/quotes).",
+        );
+      }
+      // digits-only: Number() would otherwise accept "1e3"/exponent junk (review M/L4)
       const allowedIds = (env.BOT_ALLOWED_IDS ?? "")
         .split(",")
-        .map((s) => Number(s.trim()))
-        .filter((n) => Number.isInteger(n) && n > 0);
+        .map((s) => s.trim())
+        .filter((s) => /^\d+$/.test(s))
+        .map((s) => Number(s))
+        .filter((n) => Number.isSafeInteger(n) && n > 0);
       return {
         token,
         allowedIds,
