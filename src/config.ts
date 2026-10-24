@@ -59,6 +59,8 @@ export interface AppConfig {
   /** §4.15 Render profile: monthly egress budget in bytes. Default is 0 =
    * unlimited; set MONTHLY_BYTES_BUDGET to opt into a soft cap (404-fallback). */
   monthlyBytesBudget: number;
+  /** M7.9: when true, /status includes total + per-channel library byte sizes. */
+  trackSizes: boolean;
   /** §4.15 deploy overlap: boot-time retries for AUTH_KEY_DUPLICATED. */
   bootAuthRetries: number;
   /** Wait between boot auth retries (seconds). */
@@ -260,6 +262,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     allowDownloads: boolEnv(env, "ALLOW_DOWNLOADS", true),
     checkValidLossless: boolEnv(env, "CHECK_VALID_LOSSLESS", false),
     monthlyBytesBudget: intEnv(env, "MONTHLY_BYTES_BUDGET", 0, 0, 1_000_000_000_000),
+    // M7.9: library byte stats are opt-in (computation kept off the hot path by default)
+    trackSizes: boolEnv(env, "TRACK_SIZE_STATS", false),
     bootAuthRetries: intEnv(env, "BOOT_AUTH_RETRIES", 3, 1, 10),
     bootAuthRetryWaitSeconds: intEnv(env, "BOOT_AUTH_RETRY_WAIT_SECONDS", 60, 0, 3_600),
     setupEnabled: parseSetupEnabled(env),

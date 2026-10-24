@@ -2,6 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { CHAT_ID } from "./util.js";
 import { buildTestServer, TEST_SECRET, fetchJson, type TestServer } from "./util.js";
 import { createMediaToken } from "../src/sign.js";
 
@@ -74,6 +75,31 @@ test("status: secret-gated ops diagnostics (moved off public healthz)", async ()
   const ring = s2.lastSearches as string[];
   assert.equal(ring.length, 10, "lastSearches caps at ten");
   assert.deepEqual(ring.slice(-10), Array.from({ length: 10 }, (_, i) => `probe${i + 2}`));
+});
+
+/* ------------------------------------------------- M7.9 status byte sizes */
+
+test("status: per-channel + total byte sizes behind TRACK_SIZE_STATS (off by default)", async () => {
+  // off: the keys are simply absent (default keeps /status lean)
+  const offBody = (await (await fetchJson(ts, `/${S}/status`)).json() as any) as Record<string, unknown>;
+  assert.equal(offBody.totalBytes, undefined, "no byte total without TRACK_SIZE_STATS");
+  assert.equal(offBody.byChannel, undefined, "no byChannel without TRACK_SIZE_STATS");
+
+  // on: one GROUP BY pass feeds totalBytes + byChannel
+  const ts2 = await buildTestServer({ extraEnv: { TRACK_SIZE_STATS: "1" } });
+  try {
+    const body = (await (await fetchJson(ts2, `/${S}/status`)).json() as any) as Record<string, unknown>;
+    assert.equal(typeof body.totalBytes, "number", "totalBytes present");
+    assert.ok((body.totalBytes as number) > 0, "fixture rows carry real byte sizes");
+    const chan = (body.byChannel as Array<{ chatId: number; count: number; bytes: number }>).find(
+      (c) => c.chatId === CHAT_ID,
+    );
+    assert.ok(chan, "fixture channel listed in byChannel");
+    assert.ok(chan.count >= 1, "per-channel count matches");
+    assert.equal(chan.bytes, body.totalBytes, "single-channel fixture: channel size == total");
+  } finally {
+    await ts2.cleanup();
+  }
 });
 
 /* ------------------------------------------------------------------- search */

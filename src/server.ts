@@ -17,6 +17,7 @@ import { ConfigStore, DEFAULT_CONFIG_FILE } from "./configStore";
 import { deriveInstanceId, SessionLease } from "./lease";
 import {
   countTracks,
+  channelSizes,
   createSchema,
   getTrack,
   openDb,
@@ -730,6 +731,8 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
       budgetBytes: budget.usedLocal, // §4.15 (process-local; bytes:month is the shared truth)
       monthlyBytesBudget: cfg.monthlyBytesBudget,
       indexCount: countTracks(db),
+      // M7.9: library byte stats — opt-in (TRACK_SIZE_STATS=1), absent when off
+      ...(cfg.trackSizes ? channelSizes(db) : {}),
       indexing: Boolean(runtime.indexer?.active),
       lastSyncAt: runtime.indexer?.lastSyncAt ?? 0,
       // M7.3: sync health at a glance

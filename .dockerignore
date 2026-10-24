@@ -1,0 +1,12 @@
+# Build-context hygiene: the Dockerfile COPYs only package/src/scripts, so
+# these are pure speed/safety guards (keep secrets and runtime data out of
+# the context on local builds).
+.git
+.github
+node_modules
+data
+.env
+.env.*
+test
+docs
+*.md

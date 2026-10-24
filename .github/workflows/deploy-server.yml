@@ -1,0 +1,41 @@
+name: deploy-server
+
+# Self-host auto-deploy (docs/selfhost.md): chain directly behind the "release"
+# workflow — it already gates every main push with npm ci + typecheck + tests.
+# Only when that pipeline is green on main does the server pull and rebuild.
+# The server pulls with `git reset --hard origin/main` so it deploys the exact
+# ref CI verified; its `.env` and `data/` are untracked and never touched.
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   SSH_HOST, SSH_USER, SSH_KEY (private deploy key, OpenSSH format), SSH_PORT (optional, default 22).
+
+on:
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-server
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          key: ${{ secrets.SSH_KEY }}
+          script_stop: true
+          script: |
+            cd /opt/mystotune
+            bash scripts/selfhost-deploy.sh

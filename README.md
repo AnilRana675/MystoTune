@@ -2,14 +2,17 @@
 
 A [BitChord](https://github.com/kushagrasinghx/BitChord) addon server that indexes music shared in your own
 Telegram channels and streams it back with signed URLs, random access and byte-exact
-seeking. Spec source of truth: `docs/BitChord Telegram Addon PRD & TRD (v2).md`.
+seeking.
 
 ```
 src/            server.ts (routes, media proxy) · db.ts (SQLite+FTS5) · indexer.ts
                 (track ids, metadata cleaning, §4.5 quality tiers) · telegram.ts ·
-                media.ts (ranges + admission control) · sign.ts (HMAC tokens) · config.ts
-scripts/        seed-fixture.ts · session.mjs (M1) · channels.mjs (M1)
-test/           contract/range/query/admission/fault/m1/m2/m3/m4/m6 suites + fake-redis + soak
+                media.ts (ranges + admission control) · sign.ts (HMAC tokens) ·
+                query.ts (typed-search lexer) · config.ts (env > store > defaults) ·
+                configStore.ts · setup.ts (first-run wizard) · index-loop.ts ·
+                download-window.ts · keys.ts · lease.ts · probe.ts
+scripts/        seed-fixture.ts · session.mjs (M1) · channels.mjs (M1) · sync-once.ts
+test/           contract/range/query/admission/fault/m1/m2/m3/m4/m6/m7 suites + fake-redis + soak
 ```
 
 ## Quick start (Render, ~10 minutes, no terminal)
@@ -33,7 +36,8 @@ test/           contract/range/query/admission/fault/m1/m2/m3/m4/m6 suites + fak
      attempts lock the IP for 15 minutes),
    - **Channels** — pick your music channels; you can preview each channel's
      audio count via the Telegram music filter,
-   - **Options** — download permission and monthly bandwidth budget.
+   - **Options** — download permission and monthly bandwidth budget (0 = unlimited,
+     which is the default).
 4. Press **Verify**: every row (Redis, Telegram, each channel, audio, public
    URL, lease) has to be green, then **Finish** — the addon swaps
    SETUP → STANDBY → ACTIVE without a terminal.
@@ -43,8 +47,11 @@ test/           contract/range/query/admission/fault/m1/m2/m3/m4/m6 suites + fak
 
 Ops notes: deploys are manual (auto-deploy off — this is what makes the
 Redis session-lease hand-over safe, doc §7.11), redeploys overlap for ≤15 s
-without killing your Telegram session, and a failed login re-opens setup
-with a banner. Details in `docs/render.md`.
+without killing your Telegram session, a failed login re-opens setup
+with a banner, and an emptied disk re-indexes the fast way — the boot
+restores tracks + sync cursors from the Redis index snapshot
+(`REDIS_SNAPSHOT=1`) in under a second instead of crawling Telegram again.
+Details in `docs/render.md`.
 
 BitChord-compat notes (verified against BitChord's source): `quality=LOW/HIGH/
 LOSSLESS` is advisory — the addon serves the channel's canonical rendition and
@@ -62,13 +69,13 @@ Plain words work exactly as before — the grammar is opt-in:
 - `artist:m83` / `album:hurry` / `title:"day glow"` — field scoping
   (single word = prefix match; quotes = exact phrase in that field);
 - `"midnight city"` — quoted phrase, word order matters;
-- `lossless` — only lossless results (FLAC/ALAC);
+- `lossless` — only lossless results (FLAC, WAV, AIFF);
 - `dur:>=300` `dur:<180` `dur:180` — duration windows in seconds;
 - `recent:7d` — only tracks added in the last 7 days (up to 3650d);
 - `sort:recent` / `sort:oldest` / `sort:longest` / `sort:relevance` —
-  explicit ordering (default `relevance`, unchanged from v0.6).
+  explicit ordering (default `relevance`).
 
-Combine freely: `artist:m83 lossless`, `title:'skinny love' dur:<200`,
+Combine freely: `artist:m83 lossless`, `title:"skinny love" dur:<200`,
 `recent:2 sort:recent`. Unknown prefixes degrade back to plain text.
 The last 10 queries show up in `/{secret}/status` as `lastSearches` — handy to
 confirm what BitChord actually sent.
@@ -96,15 +103,17 @@ forces an immediate index pass against the live session. Never run `npm run
 session` on an untrusted machine: the StringSession is your Telegram account
 credential.
 
-## The endpoints (M0 contract, M4 artwork)
+## The endpoints (M0 contract, M4 artwork, M7 ops split)
 
 | Route                             | Notes                                                     |
 | --------------------------------- | --------------------------------------------------------- |
 | `GET /{secret}/manifest.json`     | `'search'`,`'stream'` resources; `no-store`               |
-| `GET /{secret}/search?q=&quality=&atmos=` | FTS5 + bm25, hostile-q safe, order kept, cap 25    |
+| `GET /{secret}/search?q=&quality=&atmos=` | FTS5 + bm25 + typed grammar, hostile-q safe, order kept, cap 25 |
 | `GET /{secret}/stream/{id}`       | signed media URL; 404 empty on miss; 503/429 upstream     |
 | `GET|HEAD /media/{token}`         | no secret prefix (signature is the credential)            |
 | `GET|HEAD /art/{token}`           | M4 artwork: kind-tagged token, ETag/304, thumbless ⇒ 404  |
+| `GET /healthz`                    | public liveness — `{ok, mode}` only, deliberate           |
+| `GET /{secret}/status`            | the ops payload: memory, index, sync health, last searches, counters |
 
 `/media` honours `Range` (200/206/416), `If-Range`, optimistic `HEAD`,
 `ETag {docId}-{size}`, `Cache-Control: private, max-age=300`; ≤4 KiB probes and HEAD
@@ -120,51 +129,35 @@ the `GET /media` byte bridge streams real `upload.GetFile` windows — 512 KiB-a
 (never crossing a 1 MiB edge), head/tail trimmed to the requested range, one chunk in
 flight plus one read-ahead, `FILE_REFERENCE_EXPIRED` re-fetches the message and
 retries the window exactly once, mid-stream truncation is an error, client disconnect
-aborts the pipeline, and the file DC is kept warm (first-byte p95 < 600 ms; seek
-storms stay in the 0.2-0.6 s band). The first chunk is fetched *before* the HTTP
-headers are committed, so cold/FloodWait/expired-reference failures surface as real
-503/429/404 instead of a connect-then-truncate.
+aborts the pipeline, and the file DC is kept warm. The first chunk is fetched
+*before* the HTTP headers are committed, so cold/FloodWait/expired-reference
+failures surface as real 503/429/404 instead of a connect-then-truncate.
+
+## Self-hosting (your own server, auto-deploy on push)
+
+Docker Compose + GitHub Actions SSH deploy: push to `main` → CI gate → server
+pulls, rebuilds, health-checks. nginx/Caddy front it with TLS; no Redis needed
+(disk persists); per-IP rate limits keep working behind a proxy
+(`trustProxy` is enabled). Full guide: **[docs/selfhost.md](docs/selfhost.md)**.
 
 ## Tests & soak
 
 ```bash
-npm test                        # 148 assertions across contract/range/query/admission/fault/m1/m2/m3/m4/m6/m7
+npm test                        # suites: contract/range/query/admission/fault/m1/m2/m3/m4/m6/m7
 npm run soak -- --seconds 60 --no-budget --out docs/m5-soak-baseline.json
 ```
 
-Baseline (M0, in-process fixtures, `NODE_OPTIONS` caps as in §4.12): 70 165 seek-storm
-requests in 60 s, **0 × 5xx**, served 19.6 GB, p50 1 ms / p95 6 ms, first-byte p95 5 ms,
-peak RSS 156 784 KiB (budget ≤ 192 MB hard / 128 MB stretch), heapUsed ≤ 27 565 KiB,
-max 2 active streams, 0 queued, no floods. Full JSON: `docs/m0-soak-baseline.json`
-(uncapped-dev comparison run kept at `docs/m0-soak-baseline-unbounded.json`).
-M2 re-run after the byte-bridge rework: 28 616 requests in 26 s, 0 × 5xx, p95 5 ms,
-peak RSS 147 620 KiB — `docs/m2-soak-baseline.json`. M5 re-run under the FR-19
-two-per-token admission (`--no-budget`: the storm would outpace any configured
-soft cap — the default is now unlimited; a 4.5 GB cap would flip /media to its
-§4.15 plain-404 fallback in ~15 s): 28 527 requests in 60 s, **0 × 5xx**, served 7.9 GB, p50 4 ms /
-p95 9 ms, max 2 active / 0 queued, RSS 227 872 KiB — `docs/m5-soak-baseline.json`.
-That 227 MB number is a harness artifact, not the service: `test/soak.ts` runs the
-server in-process under tsx, so `/healthz` RSS counts the load generator and the
-TS loader (the same sample showed heapUsed ≈ 29 MB). M6 verdict re-run (doc §13):
-the Docker bench (`scripts/docker-bench.mjs`, 192 MiB cgroup, load from the host)
-with every M4–M6 addition says slim + alpine both peak at **63 MB cgroup /
-~115 MB process RSS / 30 MB heap**, 64 k requests, 0 × 5xx, p95 12 ms —
-`docs/m6-docker-benchmark.json`. The 192 MB planning limit stands; the in-process
-soak stays for regression trends only.
-
-M3 dockerized 30-minute compose soak (`compose.bench.yaml`, cgroup 192 m / 384 m,
-no Redis, no Telegram): 2 440 456 requests, **0 × 5xx / 0 × 429 / 0 errors**, served
-44.3 GB, p50 2 ms / p95 6 ms / max 19 ms, first-byte p95 3 ms, peak process RSS
-102 420 KiB (heapUsed ≤ 28 426 KiB), max 2 active / 0 queued, no OOM, 0 restarts —
-`docs/m3-soak-baseline.json`. Docker slim-vs-alpine benchmark:
-`docs/m3-docker-benchmark.json` (slim 62 743 req / p95 5 ms / cgroup RSS 53 MiB;
-alpine 46 327 req / p95 7 ms / 49 MiB; both far inside the 192 MiB limit, so slim
-stays the default image for its glibc `MALLOC_ARENA_MAX` support).
+Baseline history (M0, M2, M5 soak runs; M3 compose; M6 Docker bench) lives in
+`docs/m*-soak-baseline.json` + `docs/m3-docker-benchmark.json` +
+`docs/m6-docker-benchmark.json`, with the numbers and their interpretation —
+including why the in-process soak's RSS reading is a harness artifact — in
+`docs/render.md`. The 192 MB planning limit stands; the in-process soak stays
+for regression trends only.
 
 ## Docs
 
-- `docs/ROADMAP.md` — milestone ledger: everything shipped plus the open
-  manual acceptance drills (source of the release-notes Highlights).
+- `docs/ROADMAP.md` — milestone ledger: everything shipped (M0–M7.7) plus the
+  open manual acceptance drills (source of the release-notes Highlights).
 - `docs/render.md` — Render ops: Blueprint, free-plan constraints, failure
   modes, redeploy lease hand-over, live-service history.
 - `.env.example` — every configuration variable, wizard-first ordering.
