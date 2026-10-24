@@ -122,6 +122,103 @@ function junkRowFromDb(row: Record<string, unknown>): ScanRow {
   };
 }
 
+/* ------------------------------------------------- B1 duplicates (pure) */
+
+/** SDD §3: lowercase, drop bracketed extras + featuring tails, punctuation
+ * collapses to separators so "Away (feat. X) [Full Song]" matches "away". */
+export function normalizeTitle(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[([].*?[)\]]/g, " ")
+    .replace(/\b(?:featuring|feat|ft)\b\.?.*$/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+export interface DupeGroup {
+  /** `dupe:{chatId}:{bestMsgId}:{smallestMember}` — one row can sit in two
+   * rule clusters, so best-msgId alone is not unique per card. */
+  id: string;
+  chatId: number;
+  members: ScanRow[]; // ordered by msgId ascending
+  best: ScanRow; // suggested keeper (SDD §3: lossless first, then biggest file)
+}
+
+/** Deterministic keeper: lossless wins, then largest file, then newest message. */
+export function pickBest(members: ScanRow[]): ScanRow {
+  return [...members].sort((a, b) => {
+    if (a.lossless !== b.lossless) return b.lossless - a.lossless;
+    const sa = a.size ?? 0;
+    const sb = b.size ?? 0;
+    if (sa !== sb) return sb - sa;
+    return b.msgId - a.msgId;
+  })[0] as ScanRow;
+}
+
+/** SDD §3 duplicate rules: same (artist, normalized title) OR exact
+ * (mime, size) twins. Rules merge into clusters (union-find over shared
+ * rows) so a pair matching both rules yields ONE card, not two. */
+export function dupeGroups(rows: ScanRow[]): DupeGroup[] {
+  const byChat = new Map<number, ScanRow[]>();
+  for (const r of rows) {
+    if (r.size === null || r.size <= 0) continue; // unparseable sizes belong to the junk sweep
+    const list = byChat.get(r.chatId) ?? [];
+    list.push(r);
+    byChat.set(r.chatId, list);
+  }
+  const out: DupeGroup[] = [];
+  for (const [chatId, list] of byChat) {
+    const clusters: Array<{ seen: Set<string>; rows: ScanRow[] }> = [];
+    // place a row into the cluster owning its key; merge clusters sharing it
+    const addTo = (key: string, r: ScanRow): void => {
+      const hits = clusters.filter((c) => c.seen.has(key));
+      if (hits.length === 0) {
+        clusters.push({ seen: new Set([key]), rows: [r] });
+        return;
+      }
+      const first = hits[0] as { seen: Set<string>; rows: ScanRow[] };
+      if (!first.rows.includes(r)) first.rows.push(r);
+      for (const extra of hits.slice(1)) {
+        for (const rr of extra.rows) if (!first.rows.includes(rr)) first.rows.push(rr);
+        for (const k of extra.seen) first.seen.add(k);
+        clusters.splice(clusters.indexOf(extra), 1);
+      }
+    };
+    for (const r of list) {
+      addTo(`t:${r.artist ?? ""}|${normalizeTitle(r.title)}`, r);
+      addTo(`s:${r.mime ?? ""}|${r.size}`, r);
+    }
+    for (const c of clusters) {
+      if (c.rows.length < 2) continue;
+      c.rows.sort((a, b) => a.msgId - b.msgId);
+      const best = pickBest(c.rows);
+      const min = c.rows[0]?.msgId;
+      out.push({
+        id: `dupe:${chatId}:${best.msgId}:${min}`,
+        chatId,
+        members: c.rows,
+        best,
+      });
+    }
+  }
+  return out.sort((a, b) => a.chatId - b.chatId || a.best.msgId - b.best.msgId);
+}
+
+/** Plain-text card body: members listed, keeper starred. */
+export function dupeCardText(g: DupeGroup): string {
+  return [
+    `👯 Duplicate set (${g.members.length} copies)`,
+    `Title: ${g.best.title}`,
+    `Artist: ${g.best.artist ?? "—"}`,
+    "",
+    ...g.members.map((r) =>
+      `${r.msgId === g.best.msgId ? "★" : "·"} msg ${r.msgId} · ${fmtBytes(r.size ?? 0)} · ${r.mime ?? "?"}${r.lossless === 1 ? " · lossless" : ""}`,
+    ),
+    "",
+    "Delete removes the other copies from your channel via your own logged-in session.",
+  ].join("\n");
+}
+
 /* ------------------------------------------------------------------ bot core */
 
 const MAX_CARDS_PER_SWEEP = 10; // courtesy cap: never flood the owner
@@ -147,17 +244,24 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
   /** Cards pushed this process — pending answers re-ask after a restart (§5). */
   const asked = new Set<string>();
 
+  const scanRows = (): ScanRow[] =>
+    (
+      db
+        .prepare(
+          "SELECT id, chatId, msgId, title, artist, duration, mime, size, bitrateKbps, lossless FROM tracks",
+        )
+        .all() as Array<Record<string, unknown>>
+    ).map(junkRowFromDb);
+
   async function sweep(): Promise<number> {
     if (!cfg.bot.enabled) return 0;
-    const rows = db
-      .prepare(
-        "SELECT id, chatId, msgId, title, artist, duration, mime, size, bitrateKbps, lossless FROM tracks",
-      )
-      .all() as Array<Record<string, unknown>>;
-    const findings = junkFindings(rows.map(junkRowFromDb)).filter((f) => !asked.has(f.id));
-    let pushed = 0;
+    const rows = scanRows();
+    const findings = junkFindings(rows).filter((f) => !asked.has(f.id));
+    const groups = dupeGroups(rows).filter((g) => !asked.has(g.id));
+    let junk = 0;
+    let dupes = 0;
     for (const f of findings.slice(0, MAX_CARDS_PER_SWEEP)) {
-      if (asked.has(f.id)) continue; // a capslice seen while sending still counts as asked
+      if (asked.has(f.id)) continue; // a cap slice seen while sending still counts as asked
       asked.add(f.id);
       try {
         const messageId = await transport.sendCard(ownerChat, junkCardText(f.row, f.why), {
@@ -167,14 +271,37 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
           ]],
         });
         if (messageId === null) asked.delete(f.id); // unknown delivery — retry next sweep
-        else pushed += 1;
+        else junk += 1;
       } catch (e) {
         asked.delete(f.id); // failed sends retry on the next sweep
         log(`bot: failed to push junk card (${(e as Error).message})`);
       }
     }
-    if (pushed > 0) log(`bot: sweep pushed ${pushed} junk card(s)`);
-    return pushed;
+    // B1: duplicate sets after junk, sharing the sweep budget
+    for (const g of groups) {
+      if (junk + dupes >= MAX_CARDS_PER_SWEEP) break;
+      asked.add(g.id);
+      try {
+        const messageId = await transport.sendCard(ownerChat, dupeCardText(g), {
+          buttons: [[
+            {
+              text: `Delete others (keep msg ${g.best.msgId})`,
+              data: `dupe:${g.chatId}:${g.best.msgId}:${g.members[0]?.msgId}:del`,
+            },
+            { text: "Keep all", data: `dupe:${g.chatId}:${g.best.msgId}:${g.members[0]?.msgId}:keep` },
+          ]],
+        });
+        if (messageId === null) asked.delete(g.id);
+        else dupes += 1;
+      } catch (e) {
+        asked.delete(g.id);
+        log(`bot: failed to push dupe card (${(e as Error).message})`);
+      }
+    }
+    if (junk + dupes > 0) {
+      log(`bot: sweep pushed ${junk} junk card(s) and ${dupes} dupe card(s)`);
+    }
+    return junk + dupes;
   }
 
   async function handleUpdate(update: TelegramUpdate): Promise<void> {
@@ -186,22 +313,44 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
       await transport.answerCallback(cb.id, "MystoTune cards are owner-only.");
       return;
     }
-    const m = /^junk:(-?\d+):(\d+):(del|keep)$/.exec(data);
-    if (!m) {
+    const junkM = /^junk:(-?\d+):(\d+):(del|keep)$/.exec(data);
+    const dupeM = /^dupe:(-?\d+):(\d+):(\d+):(del|keep)$/.exec(data);
+    if (!junkM && !dupeM) {
       await transport.answerCallback(cb.id, "Unknown card.");
       return;
     }
-    const chatId = Number(m[1]);
-    const msgId = Number(m[2]);
-    const choice = m[3] as "del" | "keep";
+    const chatId = Number(junkM?.[1] ?? dupeM?.[1]);
+    const msgId = Number(junkM?.[2] ?? dupeM?.[2]); // junk: target msg · dupe: best msg
+    const choice = (junkM ? junkM[3] : dupeM?.[4]) as "del" | "keep";
     let receipt: string;
-    if (choice === "keep") {
-      receipt = `🫶 Kept “${m[2]}” — will not be re-asked until the next restart.`;
+    let answer = choice === "keep" ? "Kept" : "Deleting…";
+    if (!dupeM) {
+      if (choice === "keep") {
+        receipt = `🫶 Kept “${msgId}” — will not be re-asked until the next restart.`;
+      } else {
+        const res = await deleter(chatId, [msgId]);
+        receipt = res.error === undefined
+          ? `✅ Deleted (msg ${msgId}). The next sync refreshes the index.`
+          : `⚠️ Could not delete (msg ${msgId}): ${res.error} — it stays queued; the next sweep re-asks.`;
+      }
     } else {
-      const res = await deleter(chatId, [msgId]);
-      receipt = res.error === undefined
-        ? `✅ Deleted (msg ${msgId}). The next sync refreshes the index.`
-        : `⚠️ Could not delete (msg ${msgId}): ${res.error} — it stays queued; the next sweep re-asks.`;
+      // B1: recompute groups at tap time — the index may have moved; stateless.
+      const dupeMin = Number(dupeM?.[3]);
+      const group = dupeGroups(scanRows()).find(
+        (g) => g.id === `dupe:${chatId}:${msgId}:${dupeMin}`,
+      );
+      if (!group) {
+        receipt = `🫥 No duplicate set left (msg ${msgId}) — maybe already handled.`;
+        answer = "Nothing left";
+      } else if (choice === "keep") {
+        receipt = `🫶 Kept the whole set — msg ${group.best.msgId} stays.`;
+      } else {
+        const others = group.members.map((r) => r.msgId).filter((id) => id !== group.best.msgId);
+        const res = await deleter(chatId, others);
+        receipt = res.error === undefined
+          ? `✅ Deleted ${res.deleted} other cop${res.deleted === 1 ? "y" : "ies"} — kept msg ${group.best.msgId} (★). The next sync refreshes the index.`
+          : `⚠️ Could not delete: ${res.error} — tap Delete others again to retry.`;
+      }
     }
     const chatT = cb.message?.chat?.id;
     const msgT = cb.message?.message_id;
@@ -212,7 +361,7 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
         log(`bot: receipt edit failed (${(e as Error).message})`);
       }
     }
-    await transport.answerCallback(cb.id, choice === "keep" ? "Kept" : "Deleting…");
+    await transport.answerCallback(cb.id, answer);
   }
 
   return { sweep, handleUpdate, stop: () => undefined };

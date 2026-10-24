@@ -11,11 +11,16 @@ import { loadConfig } from "../src/config.js";
 import { TEST_SECRET } from "./util.js";
 import {
   createCurationBot,
+  dupeCardText,
+  dupeGroups,
   junkCardText,
   junkFindings,
+  normalizeTitle,
+  pickBest,
   type BotTransport,
   type CardKeyboard,
   type Sadle,
+  type ScanRow,
   type TelegramUpdate,
 } from "../src/bot.js";
 
@@ -131,7 +136,7 @@ test("B0 end-to-end: sweep pushes owner-gated cards; delete tap drives the sessi
     const db = openDb(path.join(dir, "i.sqlite"));
     createSchema(db);
     upsertTrack(db, row());
-    upsertTrack(db, row({ id: "tg_n-100555_2", msgId: 2, title: "Ringtone", duration: 8 }));
+    upsertTrack(db, row({ id: "tg_n-100555_2", msgId: 2, title: "Ringtone", duration: 8, size: 40_000 }));
 
     const transport = new FakeTransport();
     const deletions: Array<{ chatId: number; msgIds: number[] }> = [];
@@ -189,6 +194,102 @@ test("B0 end-to-end: sweep pushes owner-gated cards; delete tap drives the sessi
     transport.failEdits = true;
     await bot.handleUpdate(tap("junk:-100555:2:del", OWNER, false));
     assert.ok(transport.answered.at(-1)?.id.startsWith("cb-"), "answered despite edit failure");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ---------------------------------------------------- B1 duplicates */
+
+function srow(over: Partial<ScanRow> & { msgId: number }): ScanRow {
+  return {
+    id: `tg_n-100555_${over.msgId}`,
+    chatId: -100555,
+    title: "Away",
+    artist: null,
+    duration: 200,
+    mime: "audio/mpeg",
+    size: 3_000_000,
+    bitrateKbps: 128,
+    lossless: 0,
+    ...over,
+  } as ScanRow;
+}
+
+test("B1 pure: normalize, cluster rules, and the deterministic keeper", () => {
+  assert.equal(normalizeTitle("Away (Official Video) [Remaster]"), "away");
+  assert.equal(normalizeTitle("Stayin' Alive — Feat. Somebody"), "stayin alive");
+
+  const groups = dupeGroups([
+    srow({ msgId: 2, size: 100 }), // "Away" — title cluster {2,3}
+    srow({ msgId: 3, size: 200, title: "away (feat. x)" }),
+    srow({ msgId: 4, artist: "DJ K" }), // different artist → own cluster, alone
+    srow({ msgId: 5, size: 500, title: "Alpha" }), // size+mime twin pair {5,6}
+    srow({ msgId: 6, size: 500, title: "Beta" }),
+    srow({ msgId: 7, size: 100, title: "Gamma", lossless: 1 }), // t-cluster {7,8}
+    srow({ msgId: 8, size: 900, title: "Gamma" }),
+    srow({ msgId: 9, size: 0 }), // zero-size rows are the junk sweep's job, not dupes
+    srow({ msgId: 10, chatId: -100777, size: 100 }), // per-chat isolation, alone
+  ]);
+  assert.deepEqual(
+    groups.map((g) => g.id),
+    ["dupe:-100555:3:2", "dupe:-100555:6:5", "dupe:-100555:7:2", "dupe:-100555:7:7"],
+  );
+  assert.equal(groups[0]!.best.msgId, 3, "title cluster keeps the bigger file");
+  assert.deepEqual(groups[1]!.members.map((r) => r.msgId), [5, 6]);
+  assert.equal(groups[2]!.best.msgId, 7, "lossless wins over size");
+  assert.ok(groups[2]!.id.endsWith(":2"), "msg 2+7 are size/mime twins (cross-title rule)");
+  assert.equal(groups[3]!.best.msgId, 7, "title twins keep the lossless copy");
+  assert.ok(groups[2]!.id !== groups[3]!.id, "twin ids stay unique across rule clusters");
+  assert.equal(pickBest(groups[1]!.members).msgId, 6, "size tie → newest message wins");
+  const card = dupeCardText(groups[0]!);
+  assert.ok(card.includes("Duplicate set (2 copies)"));
+  assert.ok(card.includes("★ msg 3"));
+  assert.ok(card.includes("· msg 2"));
+});
+
+test("B1 end-to-end: dupe card pushes once; delete tap removes only the others; gone ids answer gracefully", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "m-bot3-"));
+  try {
+    const cfg = baseEnv({ BOT_TOKEN: "123:A", BOT_ALLOWED_IDS: `${OWNER}` });
+    const db = openDb(path.join(dir, "i.sqlite"));
+    createSchema(db);
+    upsertTrack(db, row({ size: 5_000_000 })); // healthy — and a distinct size so the twin rule leaves it alone
+    upsertTrack(db, row({ id: "tg_n-100555_2", msgId: 2, title: "Away", size: 3_000_000 }));
+    upsertTrack(db, row({ id: "tg_n-100555_3", msgId: 3, title: "Away (feat. X)", size: 4_000_000 }));
+
+    const transport = new FakeTransport();
+    const deletions: Array<{ chatId: number; msgIds: number[] }> = [];
+    const deleter: Sadle = async (chatId, msgIds) => {
+      deletions.push({ chatId, msgIds });
+      return { deleted: msgIds.length };
+    };
+    const bot = createCurationBot({ cfg, db, deleter, transport, log: () => undefined });
+
+    assert.equal(await bot.sweep(), 1, "one dupe card, no junk overlap");
+    const card = transport.cards[0]!;
+    assert.ok(card.text.startsWith("👯 Duplicate set (2 copies)"));
+    assert.ok(card.text.includes("★ msg 3"), "the bigger copy is starred");
+    assert.deepEqual(
+      card.keyboard.buttons[0]!.map((b) => b.data),
+      ["dupe:-100555:3:2:del", "dupe:-100555:3:2:keep"],
+    );
+
+    await bot.sweep();
+    assert.equal(transport.cards.length, 1, "re-sweep does not re-push (restart-only memory)");
+
+    await bot.handleUpdate(tap("dupe:-100555:3:2:del"));
+    assert.deepEqual(deletions, [{ chatId: -100555, msgIds: [2] }], "only the non-keeper is deleted");
+    assert.ok(transport.edits.at(-1)?.text.startsWith("✅"), "delete receipt");
+    assert.ok(transport.edits.at(-1)?.text.includes("kept msg 3"));
+
+    await bot.handleUpdate(tap("dupe:-100555:3:2:keep"));
+    assert.equal(deletions.length, 1, "keep tap deletes nothing");
+    assert.ok(transport.edits.at(-1)?.text.startsWith("🫶"), "keep receipt");
+
+    await bot.handleUpdate(tap("dupe:-100555:9:8:del"));
+    assert.ok(transport.edits.at(-1)?.text.startsWith("🫥"), "vanished group receipt");
+    assert.equal(transport.answered.at(-1)?.text, "Nothing left");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
