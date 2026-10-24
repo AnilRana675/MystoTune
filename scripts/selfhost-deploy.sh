@@ -14,6 +14,19 @@ echo "-- deploying ${prev} -> ${next}"
 # safe by design (secrets + index live outside git).
 git reset --hard origin/main
 
+# Ownership preflight: the image user is node = uid 1000. The classic footgun
+# is a first `sudo docker compose up` that let the daemon create ./data
+# root-owned — the container then dies at openDb with SQLITE_READONLY and the
+# crash-loop is only visible in container logs. Fail HERE, with the exact fix.
+mkdir -p data
+bad_owner="$(find data ! -user 1000 -print -quit)"
+if [ -n "$bad_owner" ]; then
+  echo "!! '$bad_owner' under ./data is not owned by uid 1000 (the addon user)." >&2
+  echo "   fix on the server, then re-run this deploy:" >&2
+  echo "     sudo chown -R 1000:1000 $(pwd)/data" >&2
+  exit 1
+fi
+
 docker compose up -d --build
 
 # Health gate: the deploy fails loudly (workflow shows the logs) if the addon
