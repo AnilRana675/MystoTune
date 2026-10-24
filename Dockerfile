@@ -21,16 +21,21 @@ COPY src ./src
 COPY scripts ./scripts
 RUN npm run build
 
+FROM ${BASE_IMAGE} AS proddeps
+WORKDIR /app
+COPY package.json package-lock.json ./
+# M7.14.1: the deps npm cache carries the better-sqlite3 prebuild tarball, so
+# prebuild-install resolves from cache — no second network download, no
+# node-gyp, no host Python. Runtime never runs install scripts again.
+COPY --from=deps /root/.npm /root/.npm
+RUN npm ci --omit=dev
+
 FROM ${BASE_IMAGE} AS runtime
 ENV NODE_ENV=production \
     TZ=UTC
 WORKDIR /app
-COPY package.json package-lock.json ./
+COPY --from=proddeps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
-# prune-only: scripts must NOT re-run here — `npm ci` already built
-# better-sqlite3 (prebuild-install needs network; node-gyp needs Python 3,
-# neither guaranteed in the slim runtime image). M7.14.1 deploy fix.
-RUN npm prune --omit=dev --ignore-scripts && npm cache clean --force
 # /data is the WAL index home (§4.11); pre-own it so named/bind volumes and the
 # non-root USER both work (compose mounts initialize from the image layer).
 RUN mkdir -p /data && chown -R node:node /data

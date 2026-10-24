@@ -341,6 +341,18 @@ iberately not built: full status page = the `/status`
   — the binary from `npm ci` in the deps stage is already in node_modules
   and survives pruning. Version 0.7.14-dockerfix.
 
+- **M7.14.1b ✅ runtime deps stage (dockerfix2)** — deeper root found via the
+  follow-up deploy: the runtime stage had **no node_modules at all** —
+  `npm prune` was reinstalling the whole production tree from the registry
+  inside the runtime image (dockerfix's `--ignore-scripts` then skipped
+  better-sqlite3's binding → "Could not locate the bindings file" crash
+  loop). Now a dedicated `proddeps` stage runs `npm ci --omit=dev` with
+  scripts on, carrying `/root/.npm` over from the deps stage so
+  `prebuild-install` resolves the prebuild tarball from cache (no network,
+  no node-gyp, no Python), and the runtime simply copies that node_modules
+  — no prune, no registry install at image runtime. Version
+  0.7.14-dockerfix2.
+
 ## Open drills (manual acceptance on Render)
 
 - [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)
