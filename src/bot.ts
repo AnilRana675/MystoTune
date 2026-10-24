@@ -11,6 +11,7 @@
  */
 import type { AppConfig } from "./config";
 import type { Database } from "better-sqlite3";
+import { decidedReview, recordReview } from "./db";
 
 /* ------------------------------------------------------------------ types */
 
@@ -256,8 +257,12 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
   async function sweep(): Promise<number> {
     if (!cfg.bot.enabled) return 0;
     const rows = scanRows();
-    const findings = junkFindings(rows).filter((f) => !asked.has(f.id));
-    const groups = dupeGroups(rows).filter((g) => !asked.has(g.id));
+    const findings = junkFindings(rows).filter(
+      (f) => !asked.has(f.id) && decidedReview(db, f.id) === null,
+    );
+    const groups = dupeGroups(rows).filter(
+      (g) => !asked.has(g.id) && decidedReview(db, g.id) === null,
+    );
     let junk = 0;
     let dupes = 0;
     for (const f of findings.slice(0, MAX_CARDS_PER_SWEEP)) {
@@ -322,16 +327,21 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
     const chatId = Number(junkM?.[1] ?? dupeM?.[1]);
     const msgId = Number(junkM?.[2] ?? dupeM?.[2]); // junk: target msg · dupe: best msg
     const choice = (junkM ? junkM[3] : dupeM?.[4]) as "del" | "keep";
+    const cardId = data.slice(0, data.lastIndexOf(":")); // stable review id (no action suffix)
     let receipt: string;
     let answer = choice === "keep" ? "Kept" : "Deleting…";
     if (!dupeM) {
       if (choice === "keep") {
-        receipt = `🫶 Kept “${msgId}” — will not be re-asked until the next restart.`;
+        recordReview(db, cardId, "keep");
+        receipt = `🫶 Kept “${msgId}” — this card will not come back.`;
       } else {
         const res = await deleter(chatId, [msgId]);
-        receipt = res.error === undefined
-          ? `✅ Deleted (msg ${msgId}). The next sync refreshes the index.`
-          : `⚠️ Could not delete (msg ${msgId}): ${res.error} — it stays queued; the next sweep re-asks.`;
+        if (res.error === undefined) {
+          recordReview(db, cardId, "delete");
+          receipt = `✅ Deleted (msg ${msgId}). The next sync refreshes the index.`;
+        } else {
+          receipt = `⚠️ Could not delete (msg ${msgId}): ${res.error} — it stays queued; the next sweep re-asks.`;
+        }
       }
     } else {
       // B1: recompute groups at tap time — the index may have moved; stateless.
@@ -343,13 +353,17 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
         receipt = `🫥 No duplicate set left (msg ${msgId}) — maybe already handled.`;
         answer = "Nothing left";
       } else if (choice === "keep") {
+        recordReview(db, cardId, "keep");
         receipt = `🫶 Kept the whole set — msg ${group.best.msgId} stays.`;
       } else {
         const others = group.members.map((r) => r.msgId).filter((id) => id !== group.best.msgId);
         const res = await deleter(chatId, others);
-        receipt = res.error === undefined
-          ? `✅ Deleted ${res.deleted} other cop${res.deleted === 1 ? "y" : "ies"} — kept msg ${group.best.msgId} (★). The next sync refreshes the index.`
-          : `⚠️ Could not delete: ${res.error} — tap Delete others again to retry.`;
+        if (res.error === undefined) {
+          recordReview(db, cardId, "delete");
+          receipt = `✅ Deleted ${res.deleted} other cop${res.deleted === 1 ? "y" : "ies"} — kept msg ${group.best.msgId} (★). The next sync refreshes the index.`;
+        } else {
+          receipt = `⚠️ Could not delete: ${res.error} — tap Delete others again to retry.`;
+        }
       }
     }
     const chatT = cb.message?.chat?.id;

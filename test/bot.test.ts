@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createSchema, openDb, upsertTrack, type TrackRow } from "../src/db.js";
+import { createSchema, decidedReview, openDb, upsertTrack, type TrackRow } from "../src/db.js";
 import { loadConfig } from "../src/config.js";
 import { TEST_SECRET } from "./util.js";
 import {
@@ -290,6 +290,54 @@ test("B1 end-to-end: dupe card pushes once; delete tap removes only the others; 
     await bot.handleUpdate(tap("dupe:-100555:9:8:del"));
     assert.ok(transport.edits.at(-1)?.text.startsWith("🫥"), "vanished group receipt");
     assert.equal(transport.answered.at(-1)?.text, "Nothing left");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------- B2 durable review memory */
+
+test("B2 durable: keep + successful delete decisions survive a fresh bot over the same database", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "m-bot4-"));
+  try {
+    const cfg = baseEnv({ BOT_TOKEN: "123:A", BOT_ALLOWED_IDS: `${OWNER}` });
+    const db = openDb(path.join(dir, "i.sqlite"));
+    createSchema(db);
+    upsertTrack(db, row({ size: 5_000_000 }));
+    upsertTrack(db, row({ id: "tg_n-100555_2", msgId: 2, title: "Ringtone", duration: 8, size: 40_000 }));
+    upsertTrack(db, row({ id: "tg_n-100555_3", msgId: 3, title: "Away", size: 3_000_000 }));
+    upsertTrack(db, row({ id: "tg_n-100555_4", msgId: 4, title: "Away (feat. X)", size: 4_000_000 }));
+    upsertTrack(db, row({ id: "tg_n-100555_5", msgId: 5, title: "Rung 2", duration: 7, size: 20_000 }));
+
+    // the session seam fails only for msg 5 (simulates a transient telegram outage)
+    const deletions: Array<{ chatId: number; msgIds: number[] }> = [];
+    const deleter: Sadle = async (chatId, msgIds) => {
+      deletions.push({ chatId, msgIds });
+      return msgIds.includes(5) ? { deleted: 0, error: "telegram 420" } : { deleted: msgIds.length };
+    };
+    const bot1 = createCurationBot({
+      cfg,
+      db,
+      deleter,
+      transport: new FakeTransport(),
+      log: () => undefined,
+    });
+    assert.equal(await bot1.sweep(), 3, "two junk cards + one dupe card");
+
+    await bot1.handleUpdate(tap("junk:-100555:2:keep"));
+    await bot1.handleUpdate(tap("dupe:-100555:4:3:del"));
+    await bot1.handleUpdate(tap("junk:-100555:5:del"));
+    assert.equal(deletions.length, 2, "the failed msg-5 delete never reaches the fake twice");
+
+    assert.equal(decidedReview(db, "junk:-100555:2"), "keep", "junk keep recorded");
+    assert.equal(decidedReview(db, "dupe:-100555:4:3"), "delete", "dupe delete recorded");
+    assert.equal(decidedReview(db, "junk:-100555:5"), null, "failed delete stays undecided");
+
+    // a brand-new process over the SAME database: only the undecided card returns
+    const transport2 = new FakeTransport();
+    const bot2 = createCurationBot({ cfg, db, deleter, transport: transport2, log: () => undefined });
+    assert.equal(await bot2.sweep(), 1, "only the failed-delete junk re-asks");
+    assert.ok(transport2.cards[0]?.text.includes("Rung 2"), "the right card came back");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

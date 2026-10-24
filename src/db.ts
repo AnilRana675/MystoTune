@@ -91,6 +91,12 @@ export function createSchema(db: Database.Database): void {
       chatId TEXT PRIMARY KEY,
       minId  INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS bot_reviews (
+      id       TEXT PRIMARY KEY,
+      decidedAt INTEGER NOT NULL,
+      outcome  TEXT NOT NULL
+    );
   `);
   // v1 → v2 migration: FR-12 hasThumb column on pre-M4 databases
   const cols = db.prepare("PRAGMA table_info(tracks)").all() as Array<{ name: string }>;
@@ -201,6 +207,28 @@ export function channelSizes(db: Database.Database): { totalBytes: number; byCha
     bytes: Number(r.bytes ?? 0),
   }));
   return { totalBytes: byChannel.reduce((sum, r) => sum + r.bytes, 0), byChannel };
+}
+
+/* ---------------------------------------------------------------- bot reviews (M7.11 B2) */
+
+export type ReviewOutcome = "keep" | "delete";
+
+/** The owner's durable answer for a review card id (`junk:*` / `dupe:*`):
+ * decided cards never re-ask across restarts (SDD §5 B2). */
+export function decidedReview(db: Database.Database, id: string): ReviewOutcome | null {
+  const row = db.prepare("SELECT outcome FROM bot_reviews WHERE id = ?").get(id) as
+    | { outcome: string }
+    | undefined;
+  return row ? (row.outcome as ReviewOutcome) : null;
+}
+
+/** Idempotent: the first decision wins (PK conflict ignores later writes). */
+export function recordReview(db: Database.Database, id: string, outcome: ReviewOutcome): void {
+  db.prepare("INSERT OR IGNORE INTO bot_reviews (id, decidedAt, outcome) VALUES (?, ?, ?)").run(
+    id,
+    Date.now(),
+    outcome,
+  );
 }
 
 /* ---------------------------------------------------------------- cursors (FR-14) */
