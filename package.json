@@ -15,7 +15,7 @@
     "session": "node scripts/session.mjs",
     "channels": "node scripts/channels.mjs",
     "sync-once": "tsx scripts/sync-once.ts",
-    "test": "node --import tsx --test test/contract.test.ts test/range.test.ts test/query.test.ts test/admission.test.ts test/fault.test.ts test/m1.test.ts test/m2.test.ts test/m3.test.ts test/m4.test.ts test/m6.test.ts test/m7.test.ts",
+    "test": "node --import tsx --test test/contract.test.ts test/range.test.ts test/query.test.ts test/admission.test.ts test/fault.test.ts test/m1.test.ts test/m2.test.ts test/m3.test.ts test/m4.test.ts test/m6.test.ts test/m7.test.ts test/bot.test.ts",
     "soak": "tsx test/soak.ts"
   },
   "dependencies": {

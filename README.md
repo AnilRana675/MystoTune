@@ -143,7 +143,7 @@ pulls, rebuilds, health-checks. nginx/Caddy front it with TLS; no Redis needed
 ## Tests & soak
 
 ```bash
-npm test                        # suites: contract/range/query/admission/fault/m1/m2/m3/m4/m6/m7
+npm test                        # suites: contract/range/query/admission/fault/m1/m2/m3/m4/m6/m7/bot
 npm run soak -- --seconds 60 --no-budget --out docs/m5-soak-baseline.json
 ```
 

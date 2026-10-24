@@ -61,6 +61,8 @@ export interface AppConfig {
   monthlyBytesBudget: number;
   /** M7.9: when true, /status includes total + per-channel library byte sizes. */
   trackSizes: boolean;
+  /** M7.11 curation bot (SDD §2): zero commands; owner-only; auto sweeps. */
+  bot: { enabled: boolean; token: string; allowedIds: number[]; sweepSeconds: number };
   /** §4.15 deploy overlap: boot-time retries for AUTH_KEY_DUPLICATED. */
   bootAuthRetries: number;
   /** Wait between boot auth retries (seconds). */
@@ -264,6 +266,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     monthlyBytesBudget: intEnv(env, "MONTHLY_BYTES_BUDGET", 0, 0, 1_000_000_000_000),
     // M7.9: library byte stats are opt-in (computation kept off the hot path by default)
     trackSizes: boolEnv(env, "TRACK_SIZE_STATS", false),
+    // M7.11 curation bot: token + owner id both required; additive + optional
+    bot: (() => {
+      const token = (env.BOT_TOKEN ?? "").trim();
+      const allowedIds = (env.BOT_ALLOWED_IDS ?? "")
+        .split(",")
+        .map((s) => Number(s.trim()))
+        .filter((n) => Number.isInteger(n) && n > 0);
+      return {
+        token,
+        allowedIds,
+        enabled: token.length > 0 && allowedIds.length > 0,
+        sweepSeconds: intEnv(env, "BOT_SWEEP_SECONDS", 86_400, 60, 7 * 86_400),
+      };
+    })(),
     bootAuthRetries: intEnv(env, "BOOT_AUTH_RETRIES", 3, 1, 10),
     bootAuthRetryWaitSeconds: intEnv(env, "BOOT_AUTH_RETRY_WAIT_SECONDS", 60, 0, 3_600),
     setupEnabled: parseSetupEnabled(env),

@@ -269,6 +269,18 @@ iberately not built: full status page = the `/status`
   behind nginx. Docs: `docs/selfhost.md` (+README section, `.dockerignore`
   hygiene, certbot-side nginx reference in the doc).
 
+- **M7.11-B0 ✅ curation bot skeleton (SDD-channel-curation-bot v0.2)** —
+  zero-command owner janitor lands end-to-end: `src/bot.ts` sweeps the
+  index at startup and pushes junk review cards (SDD §3 v1 signals:
+  <15 s, <48 kbps, 0 B-size, placeholder title) to the owner chat with
+  single-use `Delete`/`Keep` buttons; taps route owner-only
+  (`BOT_ALLOWED_IDS`) and Delete executes through a new owner-session seam
+  (`TelegramManager.deleteChannelMessages`) with an edit-in-place receipt.
+  Zero new deps (Bot API over `fetch`), disabled while `BOT_TOKEN` or
+  `BOT_ALLOWED_IDS` is empty, boot untouched (§4.11 rule 3), poll loop with
+  backoff. Network-free tests: scan purity + scripted taps (stranger
+  refusal, keep-safety, delete plan, receipt, edit-failure tolerance).
+
 ## Open drills (manual acceptance on Render)
 
 - [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)
