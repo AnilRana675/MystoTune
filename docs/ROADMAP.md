@@ -331,7 +331,7 @@ iberately not built: full status page = the `/status`
   reconcile reaps app-side deletions 90 s after every restart
   (`reconcileBootDelayMs` ctor seam); (c) app-side deletes between
   restarts: set `RECONCILE_INTERVAL_HOURS=1` (env min bound).
-  Suite 160/160.
+  Suite 160/160, version 0.7.14-delindex.
 
 ## Open drills (manual acceptance on Render)
 
