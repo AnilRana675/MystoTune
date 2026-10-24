@@ -100,6 +100,9 @@ export class IndexIndexer {
     private readonly cfg: AppConfig,
     private readonly warn: (message: string) => void = console.warn,
     private readonly redis?: RedisStore | null,
+    /** M7.11-B5: fired once per sync pass with the count of newly added rows
+     * (the curation bot uses it to trigger a coalesced sweep). */
+    private readonly onNewRows?: (added: number) => void,
   ) {}
 
   start(): void {
@@ -135,10 +138,12 @@ export class IndexIndexer {
     this.active = true;
     try {
       if (this.tm.isFatal) return; // §4.13: dead sessions never sync
+      let passAdded = 0;
       for (const chatId of this.cfg.telegram.channels) {
         if (this.tm.isFatal) break;
         try {
           const added = await this.syncChat(chatId);
+          passAdded += added;
           if (added > 0) this.warn(`synced chat ${chatId}: ${added} new rows`);
         } catch (e) {
           this.lastSyncError = (e as Error)?.message ?? "sync error";
@@ -147,6 +152,7 @@ export class IndexIndexer {
       }
       this.lastSyncAt = Date.now();
       this.lastSyncError = null;
+      if (passAdded > 0) this.onNewRows?.(passAdded); // B5: coalesced, once per pass
       void this.writeIndexSnapshot(); // §4.11 (REDIS_SNAPSHOT=1): after each sync
     } finally {
       this.active = false;

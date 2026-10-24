@@ -10,6 +10,7 @@ import { createSchema, decidedReview, openDb, upsertTrack, type TrackRow } from 
 import { loadConfig } from "../src/config.js";
 import { TEST_SECRET } from "./util.js";
 import {
+  botHealth,
   createCurationBot,
   dupeCardText,
   dupeGroups,
@@ -17,6 +18,7 @@ import {
   junkFindings,
   normalizeTitle,
   pickBest,
+  startCurationBot,
   type BotTransport,
   type CardKeyboard,
   type Sadle,
@@ -453,6 +455,60 @@ test("B2 durable: keep + successful delete decisions survive a fresh bot over th
     assert.equal(await bot2.sweep(), 1, "only the failed-delete junk re-asks");
     assert.ok(transport2.cards[0]?.text.includes("Rung 2"), "the right card came back");
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------ B5: event-driven sweeps */
+
+const sleepB5 = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+test("B5 event-driven: new-row notifications trigger a trailing, coalesced sweep", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "m-bot5-"));
+  let bot: NonNullable<ReturnType<typeof startCurationBot>> | null = null;
+  try {
+    const cfg = baseEnv({ BOT_TOKEN: "123:AAAAAAAAAAAAAAAAAAAA", BOT_ALLOWED_IDS: `${OWNER}` });
+    const db = openDb(path.join(dir, "i.sqlite"));
+    createSchema(db);
+    upsertTrack(db, row()); // healthy row — the index is clean
+
+    const transport = new FakeTransport();
+    bot = startCurationBot({
+      cfg,
+      db,
+      deleter: async () => ({ deleted: 0 }),
+      transport, // gate-2 M7 seam: no real BotApi, no network
+      log: () => undefined,
+      eventDelayMs: 10, // B5 test seam: 15 s default is unusable in tests
+    })!;
+    assert.equal(botHealth.running, true, "active(Long-poll) router starts"); // sanity: router alive
+
+    // clean index: event fires, sweep scans, nothing is pushed
+    bot.notifyNewRows(5);
+    await sleepB5(80);
+    assert.equal(transport.cards.length, 0, "clean index pushes no cards");
+
+    // junk lands → one event → one card after the trailing delay
+    upsertTrack(
+      db,
+      row({ id: "tg_n-100555_9", msgId: 9, title: "Voice 1", duration: 6, size: 30_000 }),
+    );
+    bot.notifyNewRows(1);
+    await sleepB5(120);
+    assert.equal(transport.cards.length, 1, "new junk gets curated by the event sweep");
+    assert.ok(transport.cards[0]!.text.includes("Voice 1"));
+
+    // burst: three rapid notifications coalesce into ONE more sweep; the
+    // asked-memory keeps the same junk from re-appearing as a second card
+    bot.notifyNewRows(1);
+    bot.notifyNewRows(3);
+    bot.notifyNewRows(1);
+    await sleepB5(120);
+    assert.equal(transport.cards.length, 1, "bursts coalesce; asked memory blocks re-push");
+
+    assert.ok(botHealth.lastSweepAt > 0, "event sweeps update bot health");
+  } finally {
+    bot?.stop(); // clears any pending event timer
     rmSync(dir, { recursive: true, force: true });
   }
 });

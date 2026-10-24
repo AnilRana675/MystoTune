@@ -55,6 +55,9 @@ export interface BotTransport {
   editMessage(chatId: number, messageId: number, text: string): Promise<void>;
   /** Always answer taps so Telegram stops the client-side spinner. */
   answerCallback(callbackId: string, text: string): Promise<void>;
+  /** Router-only: the long-poll update source. Real = BotApi; fakes may omit
+   * it (the loop then just idles without updates) to stay network-free. */
+  getUpdates?(offset: number): Promise<TelegramUpdate[]>;
 }
 
 export interface TelegramUpdate {
@@ -241,6 +244,8 @@ const MAX_CARDS_PER_SWEEP = 10; // courtesy cap: never flood the owner
 export interface CurationBot {
   sweep(): Promise<number>; // cards pushed
   handleUpdate(update: TelegramUpdate): Promise<void>;
+  /** B5: the indexer calls this when new rows land — triggers a coalesced sweep. */
+  notifyNewRows(count: number): void;
   stop(): void;
 }
 
@@ -253,6 +258,9 @@ export interface CurationDeps {
   /** gate-2: lease/mode gate — standby replicas and drain states must not
    * poll Telegram or push cards (deps.active defaults to always-on). */
   active?: () => boolean;
+  /** B5 test seam: trailing delay after a new-rows event before the sweep
+   * (default 15 000 ms — lets the indexer pass finish flushing). */
+  eventDelayMs?: number;
 }
 
 export function createCurationBot(deps: CurationDeps): CurationBot {
@@ -429,7 +437,14 @@ export function createCurationBot(deps: CurationDeps): CurationBot {
     }
   }
 
-  return { sweep, handleUpdate, stop: () => undefined };
+  return {
+    sweep,
+    handleUpdate,
+    // B5: real notification decorates this in startCurationBot (it owns
+    // botHealth + the active() gate); the pure core has no event notion.
+    notifyNewRows: () => undefined,
+    stop: () => undefined,
+  };
 }
 
 /* ------------------------------------------------------ real Bot API transport */
@@ -497,10 +512,11 @@ export const botHealth = {
 
 /** Long-poll router loop: pushes updates into the router with error backoff. */
 export function startCurationBot(
-  deps: Omit<CurationDeps, "transport">,
+  deps: Omit<CurationDeps, "transport"> & { transport?: BotTransport },
 ): CurationBot | null {
   if (!deps.cfg.bot.enabled) return null;
-  const api = new BotApi(deps.cfg.bot.token);
+  // gate-2 M7 test seam: the transport is injectable; production keeps BotApi.
+  const api: BotTransport = deps.transport ?? new BotApi(deps.cfg.bot.token);
   const bot = createCurationBot({ ...deps, transport: api });
   // loop-level logs carry raw fetch error messages — redact the token here too
   const redLog = (line: string): void =>
@@ -548,7 +564,8 @@ export function startCurationBot(
       }
       botHealth.running = true;
       try {
-        const updates = await api.getUpdates(offset);
+        // fakes may omit getUpdates → the loop idles quietly (network-free)
+        const updates = (await api.getUpdates?.(offset)) ?? [];
         backoffMs = 1000;
         for (const u of updates) {
           if (typeof u.update_id === "number" && u.update_id >= offset) offset = u.update_id + 1;
@@ -583,11 +600,38 @@ export function startCurationBot(
   };
   void loop();
 
+  let eventTimer: ReturnType<typeof setTimeout> | null = null;
   return {
     sweep: bot.sweep,
     handleUpdate: bot.handleUpdate,
+    // B5 (SDD §5): new-rows events from the indexer trigger a trailing,
+    // coalesced sweep — new tracks get curated minutes after arriving,
+    // not at the next BOT_SWEEP_SECONDS tick. Standby replicas skip.
+    notifyNewRows: (count: number): void => {
+      if (count <= 0 || !isActive()) return;
+      if (eventTimer !== null) return; // one sweep per burst
+      eventTimer = setTimeout(() => {
+        eventTimer = null;
+        void bot
+          .sweep()
+          .then((pushed) => {
+            botHealth.sweeps += 1;
+            botHealth.lastSweepAt = Date.now();
+            lastSweep = botHealth.lastSweepAt;
+            if (pushed > 0) botHealth.pushed += pushed;
+          })
+          .catch((e: unknown) => {
+            botHealth.errors += 1;
+            redLog(`bot: event sweep failed (${(e as Error).message})`);
+          });
+      }, deps.eventDelayMs ?? 15_000);
+    },
     stop: () => {
       stopped = true;
+      if (eventTimer) {
+        clearTimeout(eventTimer);
+        eventTimer = null;
+      }
       botHealth.running = false;
       if (timer) clearTimeout(timer);
       if (resolveSleep) resolveSleep(); // gate-2 M5: wake the parked await so the loop can exit
