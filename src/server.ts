@@ -162,6 +162,10 @@ function constantTimeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ha, hb);
 }
 
+/**
+ * Build the addon routes, request guards, and error handlers without listening.
+ * The caller manages the supplied database and Telegram client's lifecycle.
+ */
 export function buildServer(opts: BuildOptions): FastifyInstance {
   const { config: cfg, db } = opts;
   // M6.2: routes read through the runtime cell so the wizard's finish flow can
@@ -715,7 +719,11 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
 
   /* -------------------------------------------------------------- healthz */
 
-  /** M7.5 privacy split: the former healthz body, now secret-gated below. */
+  /**
+   * M7.5 privacy split: build diagnostics for the secret-gated /{secret}/status.
+   * The version matches the manifest; memory sizes are rounded KiB.
+   * Database read errors propagate to the route's error handler.
+   */
   const opsStatus = () => {
     const mem = process.memoryUsage();
     return {
