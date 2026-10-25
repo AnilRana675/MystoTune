@@ -360,7 +360,8 @@ iberately not built: full status page = the `/status`
   to "0.0.0". Now the runtime copies `package.json` from proddeps again.
   (b) `/healthz` stays privacy-minimal (ok + mode only, M7.5 contract),
   and `/{secret}/status` now reports the running `version` (mirrors the
-  manifest; `ADDON_VERSION` env override wins). Suite 160/160.
+  manifest; `ADDON_VERSION` env override wins). Suite 160/160, version
+  0.7.15-versionfix.
 
 ## Open drills (manual acceptance on Render)
 
