@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { CHAT_ID } from "./util.js";
 import { buildTestServer, TEST_SECRET, fetchJson, type TestServer } from "./util.js";
+import { packageVersion } from "../src/config.js";
 import { createMediaToken } from "../src/sign.js";
 
 let ts: TestServer;
@@ -57,10 +58,9 @@ test("status: secret-gated ops diagnostics (moved off public healthz)", async ()
   const res = await fetchJson(ts, `/${S}/status`);
   assert.equal(res.status, 200);
   const s = (await res.json() as any) as Record<string, unknown>;
-  // M7.14.2: the running build version is visible in /status (mirrors the
-  // manifest version; ADDON_VERSION env override when set)
-  assert.equal(typeof s.version, "string");
-  assert.notEqual(s.version, "", "version never empty");
+  // M7.14.2: the running build version is visible in /status and mirrors the
+  // manifest version (no ADDON_VERSION override in this harness env)
+  assert.equal(s.version, packageVersion(), "status version mirrors the package/manifest version");
   for (const k of ["rss", "heapUsed", "heapTotal", "external", "arrayBuffers", "indexCount"]) {
     assert.equal(typeof s[k], "number", k);
   }
@@ -79,6 +79,17 @@ test("status: secret-gated ops diagnostics (moved off public healthz)", async ()
   const ring = s2.lastSearches as string[];
   assert.equal(ring.length, 10, "lastSearches caps at ten");
   assert.deepEqual(ring.slice(-10), Array.from({ length: 10 }, (_, i) => `probe${i + 2}`));
+});
+
+test("status: ADDON_VERSION env overrides the package version (M7.14.2)", async () => {
+  const ts2 = await buildTestServer({ extraEnv: { ADDON_VERSION: "9.9.9-test" } });
+  try {
+    const body = (await (await fetchJson(ts2, `/${S}/status`)).json() as any) as Record<string, unknown>;
+    assert.equal(body.version, "9.9.9-test", "explicit env wins over packageVersion()");
+    assert.notEqual(body.version, packageVersion(), "asserted against the override, not the package value");
+  } finally {
+    await ts2.cleanup();
+  }
 });
 
 /* ------------------------------------------------- M7.9 status byte sizes */
