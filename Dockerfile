@@ -35,6 +35,10 @@ ENV NODE_ENV=production \
     TZ=UTC
 WORKDIR /app
 COPY --from=proddeps /app/node_modules ./node_modules
+# package.json rides along: startup walks ../../package.json for the addon
+# manifest version (FR-24/packageVersion) — without it the manifest falls
+# back to "0.0.0" (M7.14.2: the dockerfix2 image dropped this copy).
+COPY --from=proddeps /app/package.json ./package.json
 COPY --from=build /app/dist ./dist
 # /data is the WAL index home (§4.11); pre-own it so named/bind volumes and the
 # non-root USER both work (compose mounts initialize from the image layer).

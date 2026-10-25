@@ -353,6 +353,15 @@ iberately not built: full status page = the `/status`
   — no prune, no registry install at image runtime. Version
   0.7.14-dockerfix2.
 
+- **M7.14.2 ✅ version visibility** — "why doesn't the addon show a
+  version?": two gaps. (a) The dockerfix2 runtime stage stopped copying
+  `package.json`, and the addon manifest version walks
+  `../../package.json` at startup (FR-24/packageVersion) → it fell back
+  to "0.0.0". Now the runtime copies `package.json` from proddeps again.
+  (b) `/healthz` stays privacy-minimal (ok + mode only, M7.5 contract),
+  and `/{secret}/status` now reports the running `version` (mirrors the
+  manifest; `ADDON_VERSION` env override wins). Suite 160/160.
+
 ## Open drills (manual acceptance on Render)
 
 - [ ] Fresh account to first play ≤ 10 min (manual, needs a real account)

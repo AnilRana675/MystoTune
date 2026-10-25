@@ -721,6 +721,7 @@ export function buildServer(opts: BuildOptions): FastifyInstance {
     return {
       ok: runtime.telegram.state !== "fatal",
       mode: modeBox.mode, // M6.1 (doc 7.2): setup | standby | active | draining | failed
+      version: cfg.addonVersion, // M7.14.2: the running build, visible in /status
       uptimeSec: Math.round((Date.now() - metrics.since) / 1000),
       rss: kb(mem.rss),
       heapUsed: kb(mem.heapUsed),

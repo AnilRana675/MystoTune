@@ -57,6 +57,10 @@ test("status: secret-gated ops diagnostics (moved off public healthz)", async ()
   const res = await fetchJson(ts, `/${S}/status`);
   assert.equal(res.status, 200);
   const s = (await res.json() as any) as Record<string, unknown>;
+  // M7.14.2: the running build version is visible in /status (mirrors the
+  // manifest version; ADDON_VERSION env override when set)
+  assert.equal(typeof s.version, "string");
+  assert.notEqual(s.version, "", "version never empty");
   for (const k of ["rss", "heapUsed", "heapTotal", "external", "arrayBuffers", "indexCount"]) {
     assert.equal(typeof s[k], "number", k);
   }
